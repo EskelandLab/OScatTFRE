@@ -1,0 +1,329 @@
+---
+title: "MS_Osteosarcoma_Statistic_FinalRound_Emilydata"
+author: "XuanThangNguyen"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+# Summary 
+This script implements a simple overview of Mass Spectrometry (MS) data analysis with **DEP package**. 
+The data including 3 cell lines (HOS, U2OS and MG63), wiht 4 biological/technical replicates, that make total 36 single run
+
+The main steps of analysis:  
+- Exploring data before the differential expression analysis  
+- Importing **MS counts** into **DEP package** list    
+- Performing the analysis with **DESeq2**  
+- Exporting and exploring the results  
+
+The results are exported into a text file and visualized using ggplot heatmaps and volcano-plots. 
+
+Detailed tutorial for **DEP package** package could be accessed here:  
+- https://bioconductor.org/packages/devel/bioc/vignettes/DEP/inst/doc/DEP.html
+
+#### 1. Start section by loading R packages
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Importing required packages
+library("openxlsx")
+library("dplyr")
+library("readxl")
+library("tidyverse")
+library("DEP")
+library("ggplot2")
+library("forcats")
+# Note that DEP package install MacOS-M1 sometime have trouble that can be resolved by installing gcc lower version.
+# Time stamp
+Sys.time()
+# Note that DEP package install MacOS-M1 sometime have trouble that can be resolved by installing gcc lower version.
+set.seed(1234)
+
+# Set directory paths
+root_dir <- rprojroot::find_root(rprojroot::has_dir("catTFRE_MS_FinalRound"))
+analysis_dir <- file.path(root_dir, "catTFRE_MS_FinalRound/DEP_Plots_ALL")
+plots_dir <- file.path(analysis_dir, "DEP_Plots")
+# Create plots_dir if it doesn't exist
+if (!dir.exists(plots_dir)) {
+  dir.create(plots_dir, recursive = TRUE)
+}
+
+```
+
+
+```{r, ALL SUM}
+## Import the data
+catTRFE_MS_Round4 <- read.xlsx(file.path(analysis_dir, "catTRFR_MS_MG63_U2OS_HOS_Round4_sum_extend.xlsx"), rowNames = F)
+# colnames(catTRFE_MS_Round4)
+
+## Data sample Overview
+# Experiment design for Total with only 1 replication will not consider to put number in replication column. 
+# If you set up with any replication with only one, make_se function will not works
+experimental_design <- data.frame(label = colnames(catTRFE_MS_Round4)[grep("#Spec.Sample",colnames(catTRFE_MS_Round4))],
+                                  cell = c("All", rep("MG63",16), rep("U2OS",16), rep("HOS",16)),
+                                  condition = c("All",
+                                                "MG63_All", rep("MG63_C1",5),  rep("MG63_C4", 5), rep("MG63_NE", 5),
+                                                "U2OS_All", rep("U2OS_C1",5),  rep("U2OS_C4", 5), rep("U2OS_NE", 5),
+                                                "HOS_All", rep("HOS_C1",5),  rep("HOS_C4", 5), rep("HOS_NE", 5)),
+                                  replicate = c("","","",c(1:4),"",c(1:4),"",c(1:4),
+                                                   "","",c(1:4),"",c(1:4),"",c(1:4),
+                                                   "","",c(1:4),"",c(1:4),"",c(1:4)))
+# write.xlsx(experimental_design, file = "MS_experiment_design_Round4.xlsx")
+sample_names <- experimental_design %>% 
+  mutate(sample_names=ifelse(replicate=="", condition, paste(condition, replicate, sep = "_"))) %>%
+  dplyr::select(label,sample_names)
+
+#Data with sample names
+MS_data_Round4 <- catTRFE_MS_Round4
+# Change the sample name as real name
+# colnames(catTRFE_MS_Round4)[1:49] <- sample_names$sample_names
+colnames(MS_data_Round4) <- ifelse(colnames(MS_data_Round4) %in% sample_names$label, sample_names$sample_names, colnames(MS_data_Round4))
+
+# Extract MS data with experiment
+MS_data_raw <- MS_data_Round4 %>% 
+  dplyr::select(Protein_Symbol, colnames(MS_data_Round4)[1:49]) %>%  #contains("#Spec.Sample")
+  gather(sample, expression, -Protein_Symbol) %>%
+  mutate(cell = sapply(strsplit(sample, "_"), "[", 1), 
+         construct = sapply(strsplit(sample, "_"), "[", 2),
+         experiment=paste(cell, construct, sep = "_"  ))  %>% 
+  mutate(sample = fct_relevel(sample, unique(MS_data$sample)))
+# Filtering data with out expression
+MS_data <- MS_data_raw %>% dplyr::filter(expression > 0)
+
+# See what data look like
+dplyr::count(MS_data, sample)
+dplyr::count(MS_data, experiment)
+```
+
+#### Overview of total protein Plots
+```{r}
+## Plot All data from catTFRE Mass spectrometry with expression > 0
+num_Protein <- length(unique(MS_data$Protein_Symbol))
+#Plot with ggplot2
+ggplot(MS_data, aes(x=sample, fill=experiment)) +
+  geom_bar() + 
+  coord_flip() +
+  geom_hline(yintercept = num_Protein, color = "coral1") +
+  xlab("") +
+  ylab("") +
+    # Add number annotation next to the line
+  annotate("text",
+           x = 1, #length(unique(MS_data$sample)) + 0.5,  # place outside last sample row
+           y = num_Protein + 2,  # slightly above the line
+           label = num_Protein,color = "coral1",hjust = 0) +
+  ggtitle("OS catTFRE Mass spectrometry TFs ONLY expression > 0 per samples")
+ggsave(file.path(plots_dir, "OS_catTFRE_Mass_spectrometry_Allprotein.pdf"), width=4, height=10)
+
+# Select ONLY replicate
+MS_replicates <- MS_data %>%
+  dplyr::filter(grepl("_[1-4]$", sample)) 
+table(MS_replicates$sample)
+
+# Plot
+ggplot(MS_replicates, aes(x=sample, fill=experiment)) +
+  geom_bar() + 
+  coord_flip() +
+  xlab("") +
+  ylab("Number of protein") +
+  ggtitle("OS catTFRE Mass spectrometry per samples")
+ggsave(file.path(plots_dir, "OS_catTFRE_MS_Allprotein_rainbow.pdf"), width=4, height=10)
+
+ggplot(MS_replicates, aes(x = sample, fill = experiment)) +
+  geom_bar() +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "HOS_C1"  = "#8332FF", "HOS_C4" = "#A870FF", "HOS_NE" = "#C199FF",
+      "U2OS_C1" = "#F66239", "U2OS_C4"= "#F88161", "U2OS_NE"= "#FAA188",
+      "MG63_C1" = "#56B4E9", "MG63_C4"= "#78C3ED", "MG63_NE"= "#ABDAF4"))
+#      "HOS_C1"  = "#8332FF", "HOS_C4" = "#9969C7", "HOS_NE" = "#AF8FE9",
+#      "U2OS_C1" = "#fc8d59", "U2OS_C4"= "#fdae61", "U2OS_NE"= "#fee090",
+#      "MG63_C1" = "#0570b0", "MG63_C4"= "#74add1", "MG63_NE"= "#abd9e9"))
+ggsave(file.path(plots_dir, "OS_catTFRE_MS_Allprotein_colorManual.pdf"), width=4, height=10)
+
+library(ggpattern)
+ggplot(MS_replicates, aes(x = sample)) +
+  geom_bar_pattern(
+    aes(fill = cell, pattern = construct),
+    position = "stack",
+    color = NA,                 # no bar outline
+    pattern_fill = "magenta",       # pattern color
+    pattern_color = "magenta",      # match pattern stroke
+    pattern_density = 0.05,
+    pattern_spacing = 0.06,
+    pattern_key_scale_factor = 0.5) +
+  scale_fill_manual(values = c(MG63 = "#56B4E9", U2OS = "#F66239", HOS = "#8332FF"), name = "Cell") +
+  scale_pattern_manual(values = c(C1 = "none", C4 = "stripe", NE = "crosshatch"), name = "Construct") +
+  coord_flip() +
+  labs(x = NULL, y = "Number of proteins",
+       title = "OS catTFRE Mass spectrometry per sample",
+       pattern = "Construct") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank()) + 
+  guides(fill    = guide_legend(override.aes = list(pattern = "none")),   # Cell legend: only colors
+         pattern = guide_legend(override.aes = list(fill = "white")))      # Construct legend: only patterns
+ggsave(file.path(plots_dir, "OS_catTFRE_MS_Allprotein_parttern.pdf"), width=4, height=10)
+```
+
+
+```{r, TF ONLY}
+TFs_list <- read.xlsx("TFs_list_Final.xlsx")
+# Select ONLY replicate
+MS_TF_replicates <- MS_data %>%
+  dplyr::filter(grepl("_[1-4]$", sample)) %>% 
+  dplyr::filter(Protein_Symbol %in% TFs_list$Gene_Symbol)
+table(MS_TF_replicates$sample)
+
+# Plot
+ggplot(MS_TF_replicates, aes(x=sample, fill=experiment)) +
+  geom_bar() + 
+  coord_flip() +
+  xlab("") +
+  ylab("Number of protein") +
+  ggtitle("OS catTFRE Mass spectrometry per samples")
+ggsave(file.path(plots_dir, "OS_catTFRE_MS_TFs_ONLY_rainbow.pdf"), width=4, height=10)
+
+ggplot(MS_TF_replicates, aes(x = sample, fill = experiment)) +
+  geom_bar() +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "HOS_C1"  = "#8332FF", "HOS_C4" = "#A870FF", "HOS_NE" = "#C199FF",
+      "U2OS_C1" = "#F66239", "U2OS_C4"= "#F88161", "U2OS_NE"= "#FAA188",
+      "MG63_C1" = "#56B4E9", "MG63_C4"= "#78C3ED", "MG63_NE"= "#ABDAF4"))
+#      "HOS_C1"  = "#8332FF", "HOS_C4" = "#9969C7", "HOS_NE" = "#AF8FE9",
+#      "U2OS_C1" = "#fc8d59", "U2OS_C4"= "#fdae61", "U2OS_NE"= "#fee090",
+#      "MG63_C1" = "#0570b0", "MG63_C4"= "#74add1", "MG63_NE"= "#abd9e9"))
+ggsave(file.path(plots_dir, "OS_catTFRE_MS_TFs_ONLY_colorManual.pdf"), width=4, height=10)
+
+```
+
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+# Fill missing replicates with expression = 0
+fill_missing_reps <- function(df, genes = NULL, reps = 1:4) {
+  stopifnot(all(c("Protein_Symbol","sample","expression","cell","construct","experiment") %in% names(df)))
+  
+  df2 <- df
+  if (!is.null(genes)) df2 <- df2 %>% filter(Protein_Symbol %in% genes)
+
+  # Extract replicate number from sample like HOS_NE_3
+  df2 <- df2 %>%
+    mutate(rep = suppressWarnings(as.integer(stringr::str_extract(sample, "(?<=_)\\d+$"))))
+
+  # Build all expected sample names for each gene/cell/construct
+  template <- df2 %>%
+    distinct(Protein_Symbol, cell, construct, experiment) %>%
+    tidyr::expand(Protein_Symbol, cell, construct, experiment, rep = reps) %>%
+    mutate(sample = paste(cell, construct, rep, sep = "_"))
+
+  # Join with existing data, fill missing with 0
+  out <- template %>%
+    left_join(df2, by = c("Protein_Symbol","cell","construct","experiment","rep","sample")) %>%
+    mutate(expression = ifelse(is.na(expression), 0, expression)) %>%
+    arrange(Protein_Symbol, cell, construct, rep)
+
+  out
+}
+
+# Look the Mass spec of single protein each replicate
+# RUNX2 expression
+MS_data_POI <- MS_replicates %>% filter((Protein_Symbol == "RUNX2" & cell == "HOS") |
+                                          (Protein_Symbol == "PITX1" & cell == "MG63") |
+                                          (Protein_Symbol == "FOXO1" & cell == "U2OS"))
+MS_data_POI <- fill_missing_reps(MS_data_POI, genes = c("RUNX2","FOXO1","PITX1"), reps = 1:4)
+
+
+ggplot(MS_data_POI, aes(x = sample, y = expression, fill = Protein_Symbol)) +
+  geom_col() +
+  facet_wrap(~ cell, scales = "free", strip.position = "top") +
+  scale_fill_manual(values = c(RUNX2="#8332FF", FOXO1="#F66239", PITX1="#56B4E9")) +
+  labs(x = "", y = "MS Spectral Counts",
+       title = "MS spectral counts for protein") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        strip.text = element_text(face = "bold"),
+        legend.title = element_blank())
+ggsave(file.path(plots_dir, "Spectral_count_MS_selectGenes.pdf"), width=8, height=4) # starts writing a PDF to file
+```
+
+
+
+
+```{r}
+# Vendiagram data between All protein of HOS/U2OS/MG63
+library("ggVennDiagram")
+dplyr::count(MS_data, sample)
+OS_MS  <- list(HOS_C1 = MS_data[MS_data$sample=="HOS_C1", ]$Protein_Symbol,
+               HOS_C4 = MS_data[MS_data$sample=="HOS_C4", ]$Protein_Symbol,
+               HOS_NE = MS_data[MS_data$sample=="HOS_NE", ]$Protein_Symbol,
+               U2OS_C1 = MS_data[MS_data$sample=="U2OS_C1", ]$Protein_Symbol,
+               U2OS_C4 = MS_data[MS_data$sample=="U2OS_C4", ]$Protein_Symbol,
+               U2OS_NE = MS_data[MS_data$sample=="U2OS_NE", ]$Protein_Symbol,
+               MG63_C1 = MS_data[MS_data$sample=="MG63_C1", ]$Protein_Symbol,
+               MG63_C4 = MS_data[MS_data$sample=="MG63_C4", ]$Protein_Symbol,
+               MG63_NE = MS_data[MS_data$sample=="MG63_NE", ]$Protein_Symbol)
+
+
+MS_All_TFs <- list(HOS_C1_TFs = MS_data[MS_data$sample=="HOS_C1", ]$Protein_Symbol,
+                   U2OS_C1_TFs = MS_data[MS_data$sample=="U2OS_C1", ]$Protein_Symbol,
+                   MG63_C1_TFs = MS_data[MS_data$sample=="MG63_C1", ]$Protein_Symbol,
+                   HOS_C4_TFs = MS_data[MS_data$sample=="HOS_C4", ]$Protein_Symbol,
+                   U2OS_C4_TFs = MS_data[MS_data$sample=="U2OS_C4", ]$Protein_Symbol,
+                   MG63_C4_TFs = MS_data[MS_data$sample=="MG63_C4", ]$Protein_Symbol,
+                   HOS_NE_TFs = MS_data[MS_data$sample=="HOS_NE", ]$Protein_Symbol,
+                   U2OS_NE_TFs = MS_data[MS_data$sample=="U2OS_NE", ]$Protein_Symbol,
+                   MG63_NE_TFs = MS_data[MS_data$sample=="MG63_NE", ]$Protein_Symbol)
+
+library(ComplexUpset)
+library(tidyr)
+library(dplyr)
+# Filter each set to keep only TFs
+MS_TF <- lapply(OS_MS, function(x) x[x %in% TFs_list$Gene_Symbol])
+# Convert list of sets into binary membership matrix
+input_upset_TF <- UpSetR::fromList(MS_TF) %>% as.data.frame() %>% mutate(Protein = rownames(.))
+# Add protein names back as a column
+#input_upset_TF$Protein <- rownames(input_upset_TF)
+my_order <- c("MG63_C1", "MG63_C4", "MG63_NE", "U2OS_C1", "U2OS_C4", "U2OS_NE", "HOS_C1", "HOS_C4", "HOS_NE")
+# Plot overlap only for TFs
+pdf(file.path(plots_dir,"catTFRE_All_TFs_ONLY_UpsetPlot.pdf"), width=12, height=6) # starts writing a PDF to file
+ComplexUpset::upset(input_upset_TF,
+                    intersect = my_order,
+                    name = "TF Overlap",
+                    min_size = 5, sort_sets = FALSE)
+dev.off()
+
+# 1. Convert list of sets into a binary membership matrix
+input_upset <- UpSetR::fromList(OS_MS) %>% as.data.frame()
+# 2. Add protein names as a column
+input_upset$Protein <- rownames(input_upset)
+# 3. Plot with ComplexUpset
+pdf(file.path(plots_dir,"catTFRE_All_protein_UpsetPlot.pdf"), width=12, height=6) # starts writing a PDF to file
+ComplexUpset::upset(input_upset,
+                    intersect = my_order,
+                    name = "Protein Overlap",
+                    min_size = 64, sort_sets = FALSE)
+dev.off()
+
+```
+
+#### 2.3. Load the Transcription factor list
+
+Human TFs list of Transcription Factor (TFs) were generated by merging the list TFs between: 
+Human TFs list of Human Protein Atlas database: https://www.proteinatlas.org/search/transcription+factor
+Human TFs list of AnimalTFDB: # http://bioinfo.life.hust.edu.cn/AnimalTFDB/#!/download
+Human TFs list of Human Transcription Factors network 2018: # https://doi.org/10.1016/j.cell.2018.01.029
+Human TFs list of Uniprot database: https://www.uniprot.org/uniprotkb?facets=model_organism%3A9606%2Cexistence%3A2&query=transcription%20factor 
+Human TFs list of GeneCards database: https://www.genecards.org/Search/Keyword?queryString=%22human%20transcription%20factor%22
+
+
+
+
+
+
+
