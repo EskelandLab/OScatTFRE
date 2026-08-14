@@ -1,0 +1,1003 @@
+---
+title: "catTFRE real-data — sample correlation and NE → C4 → C1 shift"
+author: "XuanThangNguyen"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Goal
+Spectral counts are normalized as `log2(count + 1)` for the correlation
+analysis. Bins for the alluvial are computed on the **raw** mean count per
+protein × cell line × condition (across the four replicates):
+
+| Bin     | Mean raw count (per condition)   |
+|---------|----------------------------------|
+| Na      | < 1   (essentially undetected)   |
+| Low     | 1 – 19                           |
+| Med     | 20 - 50                          |
+| High    | ≥ 50                             |
+
+# Setup
+
+```{r setup_env, include=FALSE}
+root_dir <- rprojroot::find_root(rprojroot::has_dir("catTFRE_MS_FinalRound"))
+analysis_dir <- file.path(root_dir, "catTFRE_MS_FinalRound")
+plots_dir <- file.path(analysis_dir, "catTFRE_corelation")
+# Create plots_dir if it doesn't exist
+if (!dir.exists(plots_dir)) {dir.create(plots_dir, recursive = TRUE)}
+
+require_packages <- c("readxl","dplyr","tidyr","tibble","stringr","purrr","ggplot2","patchwork","scales","openxlsx","ggalluvial")
+to_install <- setdiff(require_packages, rownames(installed.packages()))
+if (length(to_install))
+  install.packages(to_install, repos = "https://cloud.r-project.org")
+invisible(lapply(require_packages, library, character.only = TRUE))
+
+theme_set(theme_classic(base_size = 10) +
+          theme(plot.title = element_text(face = "bold")))
+
+CELL_LINES <- c("MG63","U2OS","HOS")
+CONDITIONS <- c("NE","C4","C1")
+REPS       <- 1:4
+BIN_LAB    <- c("Na","Low","Med","High")
+```
+
+# Load data
+```{r load}
+# Load the background data, keep at least 50% of data that appear in CRAPome
+U2OS_CRAPome <- read.xlsx(file.path(analysis_dir,"CrapDB_U2OS_StrepHA.xlsx"), rowNames = T)
+U2OS_CRAPome <- U2OS_CRAPome %>% dplyr::filter(NUM_EXPT > 1.5 & AVE_SC > 3) # 3 U2OS samples
+
+# Load the raw count
+counts_raw <- read_excel(file.path(analysis_dir,"catTFRE_Round4_HOS_MG63_U2OS_Thang.xlsx"), sheet = 1)
+# Extract the sample column
+sample_cols <- grep("^(HOS|MG63|U2OS)_(C1|C4|NE)_rep[1-4]$", colnames(counts_raw), value = TRUE)
+stopifnot("Need exactly 36 sample columns" = length(sample_cols) == 36)
+
+sample_cols <- grep("^(HOS|MG63|U2OS)_(C1|C4|NE)_rep[1-4]$",
+                    colnames(counts_raw),
+                    value = TRUE)
+# Keep rows with at least 1 non-zero values and remove the back ground
+counts_raw <- counts_raw[rowSums(counts_raw[, sample_cols] != 0) >= 1,] %>% 
+  dplyr::filter(!Gene_Symbol %in% rownames(U2OS_CRAPome))
+
+design_path <- file.path(analysis_dir, "catTFRE_CiiDER.xlsx")
+# Designed TF list from sheet catTFRE_design of the CiiDER workbook
+if (file.exists(design_path)) {
+  catTFRE_design <- read_excel(design_path, sheet = "S1A", skip = 1) %>%
+    rename_with(~ str_trim(.x)) %>%
+    mutate(across(where(is.character), str_trim))
+} else {
+  warning("Design file not found at ", design_path,
+          " — Designed flag will be all FALSE.")
+  catTFRE_design <- tibble(TF = character(0))
+}
+
+split_name <- function(x) {
+  x %>%
+    str_replace_all("\\(.*?\\)", "") %>%
+    str_replace_all("-\\d+(?=(::|--|-)|-?$)", "") %>%   # strip isoform numbers
+    str_split("::|--|-") %>%
+    map(~ toupper(str_trim(.x))) %>%
+    map(~ .x[grepl("^[A-Z][A-Z0-9]{1,}$", .x)])        # must look like a gene symbol
+}
+
+designed_TFs <- if (nrow(catTFRE_design) > 0)
+  unique(unlist(split_name(catTFRE_design$TF))) else character(0)
+
+designed_flag <- counts_raw %>%
+  transmute(Accession,
+            Gene_Symbol_up = toupper(str_trim(Gene_Symbol)),
+            Designed       = Gene_Symbol_up %in% designed_TFs)
+
+# Load the TF list database
+tf_list_path <- file.path(analysis_dir, "TFs_list_Cell2018.xlsx")
+# ---- TF database (curated list) -------------------------------------------
+if (file.exists(tf_list_path)) {
+  tf_db <- read_excel(tf_list_path, sheet = 1)
+  g  <- toupper(str_trim(as.character(tf_db$Name)))
+  u  <- str_trim(as.character(tf_db$Protein_Uniprot))
+  tf_genes_db   <- unique(g[!is.na(g) & nzchar(g) & g != "NA"])
+  tf_uniprot_db <- unique(u[!is.na(u) & nzchar(u) & u != "NA"])
+} else {
+  warning("TF list not found at ", tf_list_path,
+          " — IsTF flag will be all FALSE.")
+  tf_genes_db <- character(0); tf_uniprot_db <- character(0)
+}
+
+# Add column of TFs
+tf_flag <- counts_raw %>%
+  transmute(Accession,
+            Gene_Symbol_up      = toupper(str_trim(Gene_Symbol)),
+            Protein_Uniprot_str = str_trim(as.character(Protein_Uniprot)),
+            IsTF = (Gene_Symbol_up %in% tf_genes_db) |
+                   (Protein_Uniprot_str %in% tf_uniprot_db))
+# Show an overview of what inside the data
+cat(sprintf("Proteins: %d | Sample cols: %d | Designed TFs detectable: %d | TFs (DB) detectable: %d\n",
+            nrow(counts_raw), length(sample_cols),
+            sum(designed_flag$Designed),
+            sum(tf_flag$IsTF)))
+```
+
+
+```{r} 
+# Set the color and threshold that we can detected
+COND_COLOURS <- c(NE = "#377EB8", C4 = "#1B9E77", C1 = "#A020F0") #1B9E77 #D73027 #377EB8 # 2CA25F
+DET_THR      <- 1   # raw count threshold for "detected" (≥ DET_THR)
+
+# Prepare for the count (select the one detected in at least 1 rep)
+count_detected <- function(accessions = NULL) {
+  d <- counts_raw %>%
+    dplyr::select(Accession, all_of(sample_cols))
+  if (!is.null(accessions))
+    d <- d %>% filter(Accession %in% accessions)
+
+  d %>%
+    pivot_longer(all_of(sample_cols),
+                 names_to = "sample", values_to = "count") %>%
+    separate(sample, c("cell_line","condition","rep"),
+             sep = "_", remove = FALSE) %>%
+    mutate(rep        = as.integer(str_remove(rep, "rep")),
+           cell_line  = factor(cell_line, levels = CELL_LINES),
+           condition  = factor(condition, levels = CONDITIONS)) %>%
+    group_by(cell_line, condition, rep) %>%
+    summarise(n_detected = sum(count >= DET_THR), .groups = "drop")
+}
+
+# Count the detect protein
+det_all <- count_detected() # all proteins
+det_tf  <- count_detected(tf_flag %>% filter(IsTF) %>% pull(Accession))
+
+# Plot the counts
+plot_overview <- function(d, title) {
+  smy <- d %>%
+    group_by(cell_line, condition) %>%
+    summarise(mean = mean(n_detected),
+              sd   = sd(n_detected), .groups = "drop") 
+  # Order cell lines
+  smy$cell_line <- factor(smy$cell_line,levels = c("MG63", "U2OS", "HOS"))
+  d$cell_line <- factor(d$cell_line,levels = c("MG63", "U2OS", "HOS"))
+  # Plot
+  ggplot(smy, aes(cell_line, mean, color = condition)) +
+    geom_col(position = position_dodge(0.78),width = 0.72,fill = "white",linewidth = 0.7) +
+    geom_errorbar(aes(ymin = mean - sd,ymax = mean + sd),position = position_dodge(0.78),width = 0.18,linewidth = 0.5) +
+    geom_jitter(data = d,
+                aes(y = n_detected,group = condition,color = condition),
+                position = position_jitterdodge(jitter.width = 0.12,dodge.width = 0.78,seed = 1),
+                size = 1.8,alpha = 0.9,inherit.aes = TRUE) +
+    geom_text(aes(label = round(mean, 0),y = mean + sd + max(smy$mean) * 0.1),position = position_dodge(0.78),size = 2.6) +
+    scale_color_manual(values = COND_COLOURS,name = "Condition") +
+    labs(title = title,x = NULL,y = sprintf("# detected proteins (count ≥ %d)", DET_THR)) +
+    coord_flip() +
+    theme_classic(base_size = 10) +
+    theme(plot.title = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold", size = 10),
+          legend.position = "right")
+}
+
+# Count the dat with all protein and TF only
+p_all <- plot_overview(det_all,
+  sprintf("All proteins (n = %s)", format(nrow(counts_raw), big.mark = ",")))
+p_tf  <- plot_overview(det_tf,
+  sprintf("TFs only (n = %d)", sum(tf_flag$IsTF)))
+
+overview_grid <- (p_all | p_tf) + plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+overview_grid
+
+ggsave(file.path(plots_dir, "OS_catTFRE_overview_detected.pdf"), overview_grid, width = 6, height = 5)
+
+# Also save individual plots in case you want them standalone
+ggsave(file.path(plots_dir, "OS_catTFRE_overview_detected_all.pdf"), p_all, width = 3, height = 5)
+ggsave(file.path(plots_dir, "OS_catTFRE_overview_detected_TFs.pdf"), p_tf,  width = 3, height = 5)
+```
+
+
+```{r}
+library(rstatix)
+library(ggpubr)
+
+# Function to compute pairwise stats + get plotting coordinates
+get_stats <- function(d, dodge_width = 0.78) {
+  d %>%
+    group_by(cell_line) %>%
+    pairwise_t_test(n_detected ~ condition,
+                    p.adjust.method = "BH") %>%
+    ungroup() %>%
+    add_xy_position(x = "cell_line", dodge = dodge_width, step.increase = 0.08)
+}
+
+stats_all <- get_stats(det_all)
+stats_tf  <- get_stats(det_tf)
+
+# Updated plot_overview to accept and overlay stats
+plot_overview <- function(d, title, stats_df, show_ns = FALSE) {
+  smy <- d %>%
+    group_by(cell_line, condition) %>%
+    summarise(mean = mean(n_detected),
+              sd   = sd(n_detected), .groups = "drop")
+
+  smy$cell_line <- factor(smy$cell_line, levels = c("MG63", "U2OS", "HOS"))
+  d$cell_line   <- factor(d$cell_line,   levels = c("MG63", "U2OS", "HOS"))
+
+  # rstatix's add_xy_position() encodes x as numeric cell_line positions;
+  # re-map to match the same factor level order used in the plot
+  stats_df <- stats_df %>%
+    mutate(cell_line = factor(cell_line, levels = c("MG63", "U2OS", "HOS")))
+
+  if (!show_ns) stats_df <- stats_df %>% filter(p.adj < 0.05)
+
+  p <- ggplot(smy, aes(cell_line, mean, color = condition)) +
+    geom_col(position = position_dodge(0.78), width = 0.72,
+             fill = "white", linewidth = 0.7) +
+    geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd),
+                  position = position_dodge(0.78), width = 0.18, linewidth = 0.5) +
+    geom_jitter(data = d,
+                aes(y = n_detected, group = condition, color = condition),
+                position = position_jitterdodge(jitter.width = 0.12,
+                                                 dodge.width = 0.78, seed = 1),
+                size = 1.8, alpha = 0.9, inherit.aes = TRUE) +
+    geom_text(aes(label = round(mean, 0),
+                  y = mean + sd + max(smy$mean) * 0.1),
+              position = position_dodge(0.78), size = 2.6) +
+    scale_color_manual(values = COND_COLOURS, name = "Condition") +
+    labs(title = title, x = NULL,
+         y = sprintf("# detected proteins (count ≥ %d)", DET_THR)) +
+    coord_flip() +
+    theme_classic(base_size = 10) +
+    theme(plot.title = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold", size = 10),
+          legend.position = "right")
+
+  if (nrow(stats_df) > 0) {
+    p <- p + stat_pvalue_manual(
+      stats_df,
+      label = "p.adj.signif",
+      tip.length = 0.01,
+      size = 3,
+      coord.flip = TRUE   # tells ggpubr the plot is flipped
+    )
+  }
+  p
+}
+
+p_all <- plot_overview(det_all,
+  sprintf("All proteins (n = %s)", format(nrow(counts_raw), big.mark = ",")),
+  stats_all)
+p_tf  <- plot_overview(det_tf,
+  sprintf("TFs only (n = %d)", sum(tf_flag$IsTF)),
+  stats_tf)
+
+overview_grid <- (p_all | p_tf) + plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+overview_grid
+
+ggsave(file.path(plots_dir, "OS_catTFRE_overview_detected_statistic.pdf"), overview_grid, width = 7, height = 5)
+```
+
+
+```{r}
+library(openxlsx)
+library(dplyr)
+
+wb <- createWorkbook()
+
+# ============================================================
+# Helper function
+# ============================================================
+make_protein_sheet <- function(df, sample_cols, sheet_name){
+  protein_lists <- lapply(sample_cols, function(samp){
+    df %>%
+      filter(.data[[samp]] >= DET_THR) %>%
+      transmute(Protein = paste0(Gene_Symbol, " | ", Accession)) %>%
+      pull(Protein) %>%
+      sort()
+  })
+
+  names(protein_lists) <- sample_cols
+  max_len <- max(lengths(protein_lists))
+  protein_df <- as.data.frame(
+    lapply(protein_lists, function(x){
+      c(length(x), x, rep(NA, max_len - length(x)))}), 
+    check.names = FALSE)
+  rownames(protein_df) <- c("N_proteins", seq_len(max_len))
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet_name, protein_df, rowNames = TRUE)
+}
+
+# ============================================================
+# Sheet 1: Counts only
+# ============================================================
+summary_counts <- bind_rows(
+  lapply(sample_cols, function(samp){
+    data.frame(Sample = samp,
+               N_proteins = counts_raw %>%
+        filter(.data[[samp]] >= DET_THR) %>%
+        nrow())
+  })
+)
+
+addWorksheet(wb, "AllProtein_Counts")
+writeData(wb, "AllProtein_Counts", summary_counts)
+
+# ============================================================
+# Sheet 2: All proteins
+# ============================================================
+make_protein_sheet(df = counts_raw,
+                   sample_cols = sample_cols,
+                   sheet_name = "AllProtein_Lists")
+
+# ============================================================
+# Sheet 3: TF proteins only
+# ============================================================
+tf_accessions <- tf_flag %>%
+  filter(IsTF) %>%
+  pull(Accession)
+
+counts_tf <- counts_raw %>%
+  filter(Accession %in% tf_accessions)
+# Write the sheet
+make_protein_sheet(df = counts_tf,
+                   sample_cols = sample_cols,
+                   sheet_name = "TF_Lists")
+
+# ============================================================
+# Save
+# ============================================================
+saveWorkbook(wb,file.path(plots_dir,"OS_catTFRE_ProteinLists_PerReplicate.xlsx"), overwrite = TRUE)
+```
+
+
+
+```{r}
+# Per (cell, condition) TF detection at the GENE-SYMBOL level (not per-rep counts)
+tf_long_mean <- counts_raw %>%
+  inner_join(tf_flag %>% filter(IsTF) %>% select(Accession), by = "Accession") %>%
+  pivot_longer(all_of(sample_cols), names_to = "sample", values_to = "count") %>%
+  separate(sample, c("cell_line","condition","rep"), sep = "_", remove = FALSE) %>%
+  mutate(rep = as.integer(str_remove(rep, "rep"))) %>%
+  group_by(Accession, Gene_Symbol, cell_line, condition) %>%
+  summarise(mean_count = mean(count), .groups = "drop") %>%
+  mutate(detected = mean_count >= DET_THR,
+         gs = toupper(str_trim(Gene_Symbol)))
+
+library(UpSetR)
+library(grid)
+
+SET_ORDER <- c("HOS_C1","MG63_C1","U2OS_C1",
+               "HOS_C4","MG63_C4","U2OS_C4",
+               "HOS_NE","MG63_NE","U2OS_NE")
+
+COND_COLOURS <- c(C1 = "#A020F0",
+                  C4 = "#1B9E77",
+                  NE = "#377EB8")
+
+library(ComplexUpset)
+
+# For each cell line, build a binary detected/not matrix
+make_upset_data <- function(cl) {
+  tf_long_mean %>%
+    filter(cell_line == cl) %>%
+    select(Accession, condition, detected) %>%
+    mutate(detected = as.integer(detected)) %>%
+    pivot_wider(names_from = condition, values_from = detected, values_fill = 0)
+}
+
+# Plot per cell line
+for (cl in c("HOS", "MG63", "U2OS")) {
+  d <- make_upset_data(cl)
+  p <- upset(d, intersect = c("NE", "C4", "C1"),
+             name = paste0(cl, " – Detected TFs"),
+             width_ratio = 0.3,
+             set_sizes = FALSE)
+  ggsave(paste0("upset_", cl, ".pdf"), p, width = 6, height = 4)
+}
+```
+
+
+
+```{r}
+##=============================================================================
+## Single UpSet plot – All 9 groups (cell line × condition) as sets
+## Shows overlap of detectable protein and TFs across all cell lines and conditions
+##=============================================================================
+library(tidyverse)
+library(ComplexUpset)
+
+MIN_REPS <- 1   # detected in at least 1 of 4 reps
+# ── Build binary matrix: one column per cell_line × condition ────────────────
+tf_accessions <- tf_flag %>% filter(IsTF) %>% pull(Accession)
+
+upset_all_tf <- counts_raw %>%
+  filter(Accession %in% tf_accessions) %>%
+  pivot_longer(all_of(sample_cols),
+               names_to = "sample", values_to = "count") %>%
+  separate(sample, c("cell_line", "condition", "rep"), sep = "_") %>%
+  group_by(Accession, cell_line, condition) %>%
+  summarise(n_reps_detected = sum(count >= DET_THR), .groups = "drop") %>%
+  mutate(group    = paste0(cell_line, "_", condition),
+         detected = as.integer(n_reps_detected >= MIN_REPS)) %>%
+  select(Accession, group, detected) %>%
+  pivot_wider(names_from = group, values_from = detected, values_fill = 0L)
+
+# Define set order: grouped by cell line
+sets_ordered <- c("HOS_NE",  "HOS_C4",  "HOS_C1", 
+                  "MG63_NE", "MG63_C4", "MG63_C1",
+                  "U2OS_NE", "U2OS_C4", "U2OS_C1")
+
+# ── Colour mapping ──────────────────────────────────────────────────────────
+group_colours <- c(HOS_NE  = "#377EB8", HOS_C4  = "#1B9E77", HOS_C1  = "#A020F0",
+                   MG63_NE = "#377EB8", MG63_C4 = "#1B9E77", MG63_C1 = "#A020F0",
+                   U2OS_NE = "#377EB8", U2OS_C4 = "#1B9E77", U2OS_C1 = "#A020F0")
+# ── Plot TFs ─────────────────────────────────────────────────────────────────
+p <- upset(upset_all_tf,
+           intersect      = sets_ordered,
+           name           = "Cell line × Condition",
+           width_ratio    = 0.20,
+           min_size       = 1,
+           n_intersections = 20,
+           sort_sets      = FALSE,
+           sort_intersections_by = "cardinality",
+           set_sizes = (upset_set_size() +
+                          scale_fill_manual(values = group_colours, guide = "none")),
+           base_annotations = list("Intersection size" = (intersection_size(bar_number_threshold = 1,text = list(size = 2.5)) +
+                                                            scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+                                                            coord_cartesian(ylim = c(0, 25)) +
+                                                            scale_y_continuous(expand = expansion(mult = c(0, 0.05))))),
+           matrix = (intersection_matrix(geom    = geom_point(size = 2.5),
+                                         segment = geom_segment(linewidth = 0.6)) + 
+                       scale_color_manual(values = c("TRUE" = "black", "FALSE" = "grey85"),guide = "none")),
+           stripes = "white",
+           themes = upset_modify_themes(list(overall_sizes = theme(
+             axis.text.x  = element_text(size = 8),
+             axis.title.x = element_blank()),
+             intersections_matrix = theme(axis.text.y = element_text(size = 8, face = "bold"))))) +
+  ggtitle("Detectable TFs across all cell lines and chromatin fractions") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 13))
+
+# ggsave the plot
+ggsave(file.path(plots_dir, "catTFRE_upset_all_groups_TFs.pdf"), p, width = 10, height = 5, device = cairo_pdf)
+
+# ── Same for ALL proteins ────────────────────────────────────────────────────
+# Replace mean-based detection with replicate-counting
+
+upset_all_prot <- counts_raw %>%
+  pivot_longer(all_of(sample_cols),
+               names_to = "sample", values_to = "count") %>%
+  separate(sample, c("cell_line", "condition", "rep"), sep = "_") %>%
+  group_by(Accession, cell_line, condition) %>%
+  summarise(n_reps_detected = sum(count >= DET_THR), .groups = "drop") %>%
+  mutate(group    = paste0(cell_line, "_", condition),
+         detected = as.integer(n_reps_detected >= MIN_REPS)) %>%
+  select(Accession, group, detected) %>%
+  pivot_wider(names_from = group, values_from = detected, values_fill = 0L)
+
+p2 <- upset(upset_all_prot,
+            intersect      = sets_ordered,
+            name           = "Cell line × Condition",
+            width_ratio    = 0.20,
+            min_size       = 1,
+            n_intersections = 20,
+            sort_sets      = FALSE,
+            sort_intersections_by = "cardinality",
+            set_sizes = (upset_set_size() +
+                           scale_fill_manual(values = group_colours, guide = "none")),
+            base_annotations = list("Intersection size" = (intersection_size(bar_number_threshold = 1,text = list(size = 2.5)) +
+                                                            scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+                                                            coord_cartesian(ylim = c(0, 500)) +
+                                                            scale_y_continuous(expand = expansion(mult = c(0, 0.05))))),
+            matrix = (intersection_matrix(geom    = geom_point(size = 2.5),
+                                         segment = geom_segment(linewidth = 0.6)) + 
+                       scale_color_manual(values = c("TRUE" = "black", "FALSE" = "grey85"),guide = "none")),
+            stripes = "white",
+            themes = upset_modify_themes(list(overall_sizes = theme(axis.text.x  = element_text(size = 8),
+                                                                    axis.title.x = element_blank()),
+                                              intersections_matrix = theme(axis.text.y = element_text(size = 8, face = "bold"))))) +
+  ggtitle("Detectable proteins across all cell lines and chromatin fractions") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 13))
+# Save the plot as pdf
+ggsave(file.path(plots_dir, "catTFRE_upset_all_groups_allProteins.pdf"), p2, width = 10, height = 5, device = cairo_pdf)
+
+message("✓ Saved: upset_all_groups_TFs.pdf, upset_all_groups_allProteins.pdf")
+```
+
+
+
+```{r}
+EXAMPLE_GENES <- c("RUNX2","PITX1","FOXO1","MYBL2", "FOXC2", "NR2F2", "CTCF", "CEBPB")
+
+example_long <- counts_raw %>%
+  filter(toupper(str_trim(Gene_Symbol)) %in% toupper(EXAMPLE_GENES)) %>%
+  select(Accession, Gene_Symbol, all_of(sample_cols)) %>%
+  pivot_longer(all_of(sample_cols),
+               names_to = "sample", values_to = "count") %>%
+  separate(sample, c("cell_line","condition","rep"),
+           sep = "_", remove = FALSE) %>%
+  mutate(rep        = as.integer(str_remove(rep, "rep")),
+         cell_line  = factor(cell_line,  levels = CELL_LINES),
+         condition  = factor(condition,  levels = CONDITIONS),
+         Gene_Symbol = factor(Gene_Symbol, levels = EXAMPLE_GENES))
+
+# Sanity: which genes were found?
+example_long %>% distinct(Gene_Symbol) %>% pull(Gene_Symbol)
+
+example_summary <- example_long %>%
+  group_by(Gene_Symbol, cell_line, condition) %>%
+  summarise(mean = mean(count),
+            sd   = sd(count), .groups = "drop")
+
+# Order cell lines
+example_summary$cell_line <- factor(example_summary$cell_line,levels = c("MG63", "U2OS", "HOS"))
+example_long$cell_line <- factor(example_long$cell_line,levels = c("MG63", "U2OS", "HOS"))
+
+p_examples <- ggplot(example_summary,aes(cell_line, mean, color = condition)) +
+  geom_col(position = position_dodge(0.78),width = 0.72,fill = "white",linewidth = 0.7) +
+  geom_errorbar(aes(ymin = pmax(mean - sd, 0),ymax = mean + sd),
+                position = position_dodge(0.78),width = 0.18,linewidth = 0.5) +
+  geom_jitter(data = example_long,
+              aes(y = count,group = condition,color = condition),
+              position = position_jitterdodge(jitter.width = 0.10,dodge.width  = 0.78,seed = 1),
+              size = 1.6,alpha = 0.9) +
+  geom_text(aes(label = sprintf("%.1f", mean),y = mean + sd +0.2 * max(example_summary$mean)),
+            position = position_dodge(0.78),size = 2.4) +
+  facet_wrap(~ Gene_Symbol,scales = "free_y",nrow = 2) +
+  scale_color_manual(values = COND_COLOURS,name = "Condition") +
+  labs(title = "Example designed TFs — spectral counts per replicate",
+       x = NULL,y = "Spectral count") +
+  theme_classic(base_size = 10) +
+  theme(strip.background = element_rect(fill = "grey92",color = NA),
+        strip.text = element_text(face = "bold",size = 11),
+        axis.text.x = element_text(face = "bold",size = 9),
+        plot.title = element_text(face = "bold"),
+        legend.position = "right")
+p_examples
+
+ggsave(file.path(plots_dir, "OS_selected_genes.pdf"), p_examples, width = 12, height = 5)
+```
+
+
+# Per-cell-line sample correlation
+```{r}
+log2_mat <- counts_raw %>%
+  dplyr::select(Accession, all_of(sample_cols)) %>%
+  column_to_rownames("Accession") %>%
+  as.matrix() %>%
+  { log2(. + 1) }
+
+# Plot function
+plot_cor_heatmap <- function(cl) {
+  cols <- grep(paste0("^", cl, "_"), colnames(log2_mat), value = TRUE)
+  cm   <- cor(log2_mat[, cols], method = "pearson")
+  cm_df <- as.data.frame(cm) %>%
+    rownames_to_column("s1") %>%
+    pivot_longer(-s1, names_to = "s2", values_to = "r") %>%
+    mutate(s1 = factor(s1, levels = cols),
+           s2 = factor(s2, levels = cols))
+  # Plot
+  ggplot(cm_df, aes(s1, s2, fill = r)) +
+    geom_tile(color = "white", linewidth = 0.2) +
+    geom_text(aes(label = sprintf("%.2f", r)), size = 2) +
+    scale_fill_gradientn(colours = c("#2166ac","#f7f7f7","#D73027"),
+                         limits = c(0.5, 1), oob = scales::squish,
+                         name = "Pearson r") +
+    labs(title = sprintf("%s — catTFRE C1/C4/NE correlation", cl),
+         x = NULL, y = NULL) +
+    coord_fixed() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+          axis.text.y = element_text(size = 7),
+          legend.position = "top",
+          legend.direction = "horizontal")
+}
+
+cor_plots <- map(CELL_LINES, plot_cor_heatmap)
+cor_grid  <- wrap_plots(cor_plots, nrow = 1)
+cor_grid
+ggsave(file.path(plots_dir, "OS_MS_correlation_heatmaps_filtering_all.pdf"), cor_grid, width = 12, height = 5)
+```
+
+
+```{r eod_lod_load}
+eod_lod_path  <- file.path(analysis_dir, "EOD_LOD.xlsx")
+tf2018_path   <- file.path(analysis_dir, "TFs_list_Cell2018.xlsx")
+
+# --- TF universe (Lambert 2018 Cell paper) ---------------------------------
+tf2018 <- read_excel(tf2018_path, sheet = 1)
+tf_universe <- toupper(str_trim(as.character(tf2018$Name)))
+tf_universe <- unique(tf_universe[!is.na(tf_universe) & nzchar(tf_universe)])
+cat(sprintf("TF universe (Cell 2018): %d genes\n", length(tf_universe)))
+
+# --- EOD / LOD lists, filtered to TFs --------------------------------------
+df_lists <- read_excel(eod_lod_path, sheet = 1) %>%
+  rename_with(~ str_trim(.x))
+
+df_lists <- df_lists %>%
+  transmute(gene_symbol = toupper(str_trim(as.character(Cluster))),
+            list_lab    = toupper(str_trim(as.character(gene))),
+            cross_lab   = toupper(str_trim(as.character(.[[3]]))))
+
+EOD_all <- sort(unique(c(df_lists$gene_symbol[df_lists$list_lab == "EOD"],
+                         df_lists$gene_symbol[df_lists$list_lab == "LOD" & df_lists$cross_lab == "EOD"])))
+LOD_all <- sort(unique(df_lists$gene_symbol[df_lists$list_lab == "LOD"]))
+
+EOD <- intersect(EOD_all, tf_universe)
+LOD <- intersect(LOD_all, tf_universe)
+
+cat(sprintf("EOD raw: %d → EOD ∩ TF2018: %d\n", length(EOD_all), length(EOD)))
+cat(sprintf("LOD raw: %d → LOD ∩ TF2018: %d\n", length(LOD_all), length(LOD)))
+```
+
+```{r eod_lod_detection}
+# Detection sets per cell-line × scope, FILTERED TO TFs (Cell 2018 universe).
+# A gene is "detected" if it has count >= DET_THR in AT LEAST 1 replicate.
+DET_THR <- 1
+
+detect_TF_set <- function(cl, scope) {
+  cols <- if (scope == "C1+C4") {
+    c(paste0(cl, "_C1_rep", 1:4), paste0(cl, "_C4_rep", 1:4))
+  } else {
+    paste0(cl, "_NE_rep", 1:4)
+  }
+  gs <- toupper(str_trim(counts_raw$Gene_Symbol))
+  # ANY replicate >= DET_THR  ← was rowMeans() >= DET_THR before
+  detected_any <- rowSums(counts_raw[, cols, drop = FALSE] >= DET_THR) >= 1
+  unique(gs[detected_any & gs %in% tf_universe])
+}
+
+sets <- list(HOS_C1C4  = detect_TF_set("HOS",  "C1+C4"),
+             MG63_C1C4 = detect_TF_set("MG63", "C1+C4"),
+             U2OS_C1C4 = detect_TF_set("U2OS", "C1+C4"),
+             HOS_NE    = detect_TF_set("HOS",  "NE"),
+             MG63_NE   = detect_TF_set("MG63", "NE"),
+             U2OS_NE   = detect_TF_set("U2OS", "NE"))
+
+cat("TFs detected per cell-line × scope:\n"); print(sapply(sets, length))
+```
+
+
+
+
+```{r eod_lod_4set_helpers}
+# Detection sets per cell × scope × filter
+detect_set <- function(cl, scope, tf_only) {
+  cols <- if (scope == "C1+C4") {
+    c(paste0(cl, "_C1_rep", 1:4), paste0(cl, "_C4_rep", 1:4))
+  } else {
+    paste0(cl, "_NE_rep", 1:4)
+  }
+  gs <- toupper(str_trim(counts_raw$Gene_Symbol))
+  # ANY replicate >= DET_THR  ← was rowMeans() >= DET_THR before
+  detected_any <- rowSums(counts_raw[, cols, drop = FALSE] >= DET_THR) >= 1
+  keep <- detected_any
+  if (tf_only) keep <- keep & gs %in% tf_universe
+  unique(gs[keep])
+}
+
+# 4-set Venn for one (list, scope, filter) combination
+# NB: tf_only ONLY filters the cell-line detection sets.  
+# EOD / LOD stay at their original size (162 / 155) regardless of `tf_only`.
+plot_venn4 <- function(list_name, list_genes, scope, tf_only) {
+  v <- list()
+  v[[sprintf("%s\n(n=%d)", list_name, length(list_genes))]] <- list_genes
+  for (cl in CELL_LINES) {
+    d <- detect_set(cl, scope, tf_only)
+    v[[sprintf("%s\n(n=%d)", cl, length(d))]] <- d
+  }
+  scope_lab  <- if (scope == "C1+C4") "C1+C4 (8 reps)" else "NE only (4 reps)"
+  filter_lab <- if (tf_only) "Cells: TF-filtered (Cell 2018)" else "Cells: no filter"
+  ggVennDiagram(v, label_alpha = 0, label = "count",
+                edge_size = 0.4, set_size = 3) +
+    scale_fill_gradient(low = "#f0f9ff", high = "darkgreen") + # orange
+    labs(title = sprintf("%s — %s", filter_lab, scope_lab)) +
+    theme(plot.title       = element_text(face = "bold", size = 10),
+          legend.position  = "none")
+}
+
+
+library("ggVennDiagram")
+# 2x2 grid of EOD ∩ HOS ∩ MG63 ∩ U2OS  Venns
+fig_EOD <- ((plot_venn4("EOD", EOD_all, "C1+C4", TRUE) |
+             plot_venn4("EOD", EOD_all, "C1+C4", FALSE)) /
+            (plot_venn4("EOD", EOD_all, "NE",   TRUE) |
+             plot_venn4("EOD", EOD_all, "NE",   FALSE))) +
+  plot_annotation(title    = "EOD ∩ HOS ∩ MG63 ∩ U2OS — 4-set Venn (all combinations)",
+                  subtitle = "Rows: scope (pull / NE)   ·   Columns: filter (TFs only / all proteins)",
+                  theme = theme(plot.title    = element_text(face = "bold", size = 13),
+                  plot.subtitle = element_text(size = 9, color = "grey25")))
+fig_EOD
+ggsave(file.path(plots_dir, "catTFRE_EOD_venn4_all_combos.pdf"),fig_EOD, width = 14, height = 11)
+
+# 2x2 grid of EOD ∩ HOS ∩ MG63 ∩ U2OS  Venns
+fig_EOD_TF <- ((plot_venn4("EOD", EOD, "C1+C4", TRUE) |
+             plot_venn4("EOD", EOD, "C1+C4", FALSE)) /
+            (plot_venn4("EOD", EOD, "NE",   TRUE) |
+             plot_venn4("EOD", EOD, "NE",   FALSE))) +
+  plot_annotation(title    = "EOD TFonly ∩ HOS ∩ MG63 ∩ U2OS",
+                  subtitle = "Rows: scope (pull / NE)   ·   Columns: filter (TFs only / all proteins)",
+                  theme = theme(plot.title    = element_text(face = "bold", size = 13),
+                  plot.subtitle = element_text(size = 9, color = "grey25")))
+fig_EOD_TF
+ggsave(file.path(plots_dir, "catTFRE_EOD_TF_ONLY.pdf"),fig_EOD_TF, width = 14, height = 11)
+
+# ── Gene lists for EOD panels only ────────────────────────────────────────────
+get_venn4_gene_lists <- function(list_name, list_genes, scope, tf_only) {
+  v <- list()
+  v[[list_name]] <- list_genes
+  for (cl in CELL_LINES) v[[cl]] <- detect_set(cl, scope, tf_only)
+
+  set_names <- names(v)
+  combos    <- do.call(c, lapply(1:4, function(k) combn(set_names, k, simplify = FALSE)))
+
+  rows <- lapply(combos, function(pos) {
+    neg   <- setdiff(set_names, pos)
+    genes <- Reduce(intersect, v[pos])
+    for (n in neg) genes <- setdiff(genes, v[[n]])
+    genes <- sort(genes)
+    col_label <- if (length(pos) == 1) paste0(pos, "_only")
+                 else paste(pos, collapse = " & ")
+    tibble(region = col_label, n_genes = length(genes),
+           gene_list = paste(genes, collapse = ", "))
+  })
+
+  bind_rows(rows) %>% filter(n_genes > 0) %>% arrange(desc(n_genes))
+}
+
+# EOD-only panel params (4 panels matching the 2×2 grid above)
+eod_params <- tribble(~list_name, ~list_genes, ~scope,   ~tf_only,
+                      "EOD",      EOD,         "C1+C4",  TRUE,
+                      "EOD",      EOD,         "C1+C4",  FALSE,
+                      "EOD",      EOD,         "NE",     TRUE,
+                      "EOD",      EOD,         "NE",     FALSE)
+
+eod_gene_lists <- eod_params %>%
+  mutate(filter_lab = if_else(tf_only, "TF_only", "all_proteins"),
+         sheet_name = sprintf("EOD_%s_%s", str_replace(scope, "\\+", ""), filter_lab),
+         gene_table = pmap(list(list_name, list_genes, scope, tf_only), get_venn4_gene_lists))
+
+# Wide format: one column per intersection region
+make_wide_gene_table <- function(tbl) {
+  regions     <- tbl$region
+  genes_split <- lapply(tbl$gene_list, function(x) strsplit(x, ", ")[[1]])
+  nmax        <- max(lengths(genes_split))
+  padded      <- lapply(genes_split, function(v) c(v, rep("", nmax - length(v))))
+  out         <- as.data.frame(setNames(padded, regions), stringsAsFactors = FALSE)
+  count_row   <- as.data.frame(setNames(as.list(paste0("n=", tbl$n_genes)), regions),
+                               stringsAsFactors = FALSE)
+  rbind(count_row, out)
+}
+
+# Export: 4 sheets (one per EOD panel)
+wb_eod <- createWorkbook()
+hdr    <- createStyle(fontColour = "white", fgFill = "#1F4E78", textDecoration = "bold")
+
+for (i in seq_len(nrow(eod_gene_lists))) {
+  sn   <- eod_gene_lists$sheet_name[i]
+  wide <- make_wide_gene_table(eod_gene_lists$gene_table[[i]])
+  addWorksheet(wb_eod, sn)
+  writeData(wb_eod, sn, wide, headerStyle = hdr)
+  freezePane(wb_eod, sn, firstRow = TRUE, firstActiveRow = 3)
+  setColWidths(wb_eod, sn, cols = 1:ncol(wide), widths = 20)
+}
+
+saveWorkbook(wb_eod,
+             file.path(plots_dir, "EOD_Venn4_intersection_gene_lists.xlsx"),
+             overwrite = TRUE)
+
+```
+
+
+
+```{r eod_lod_4set_LOD}
+# Detection sets per cell × scope × filter
+detect_set <- function(cl, scope, tf_only) {
+  cols <- if (scope == "C1+C4") {
+    c(paste0(cl, "_C1_rep", 1:4), paste0(cl, "_C4_rep", 1:4))
+  } else {
+    paste0(cl, "_NE_rep", 1:4)
+  }
+  gs <- toupper(str_trim(counts_raw$Gene_Symbol))
+  # ANY replicate >= DET_THR  ← was rowMeans() >= DET_THR before
+  detected_any <- rowSums(counts_raw[, cols, drop = FALSE] >= DET_THR) >= 1
+  keep <- detected_any
+  if (tf_only) keep <- keep & gs %in% tf_universe
+  unique(gs[keep])
+}
+
+# LOD stay at their original size ( 155) regardless of `tf_only`.
+plot_venn4 <- function(list_name, list_genes, scope, tf_only) {
+  v <- list()
+  v[[sprintf("%s\n(n=%d)", list_name, length(list_genes))]] <- list_genes
+  for (cl in CELL_LINES) {
+    d <- detect_set(cl, scope, tf_only)
+    v[[sprintf("%s\n(n=%d)", cl, length(d))]] <- d
+  }
+  scope_lab  <- if (scope == "C1+C4") "C1+C4 (8 reps)" else "NE only (4 reps)"
+  filter_lab <- if (tf_only) "Cells: TF-filtered (Cell 2018)" else "Cells: no filter"
+  ggVennDiagram(v, label_alpha = 0, label = "count",
+                edge_size = 0.4, set_size = 3) +
+    scale_fill_gradient(low = "#f0f9ff", high = "orange") + # orange darkgreen
+    labs(title = sprintf("%s — %s", filter_lab, scope_lab)) +
+    theme(plot.title       = element_text(face = "bold", size = 10),
+          legend.position  = "none")
+}
+
+fig_LOD <- ((plot_venn4("LOD", LOD_all, "C1+C4", TRUE) |
+             plot_venn4("LOD", LOD_all, "C1+C4", FALSE)) /
+            (plot_venn4("LOD", LOD_all, "NE",   TRUE) |
+             plot_venn4("LOD", LOD_all, "NE",   FALSE))) +
+  plot_annotation(
+    title    = "LOD ∩ HOS ∩ MG63 ∩ U2OS — 4-set Venn (all combinations)",
+    subtitle = "Rows: scope (pull / NE)   ·   Columns: filter (TFs only / all proteins)",
+    theme = theme(plot.title    = element_text(face = "bold", size = 13),
+                  plot.subtitle = element_text(size = 9, color = "grey25")))
+fig_LOD
+ggsave(file.path(plots_dir, "catTFRE_LOD_venn4_all_combos.pdf"), fig_LOD, width = 14, height = 11)
+
+fig_LOD_TF <- ((plot_venn4("LOD", LOD, "C1+C4", TRUE) |
+             plot_venn4("LOD", LOD, "C1+C4", FALSE)) /
+            (plot_venn4("LOD", LOD, "NE",   TRUE) |
+             plot_venn4("LOD", LOD, "NE",   FALSE))) +
+  plot_annotation(
+    title    = "LOD TF only ∩ HOS ∩ MG63 ∩ U2OS",
+    subtitle = "Rows: scope (pull / NE)   ·   Columns: filter (TFs only / all proteins)",
+    theme = theme(plot.title    = element_text(face = "bold", size = 13),
+                  plot.subtitle = element_text(size = 9, color = "grey25")))
+fig_LOD_TF
+ggsave(file.path(plots_dir, "catTFRE_LOD_TF_ONLY.pdf"), fig_LOD_TF, width = 14, height = 11)
+
+
+
+# ── Gene lists for all LOD panels (LOD_all + LOD, 4 panels each = 8 sheets) ───
+lod_params <- tribble(~list_name, ~list_genes, ~scope,   ~tf_only,
+                      "LOD_TF",   LOD,         "C1+C4",  TRUE,        # matches fig_LOD_TF top-left
+                      "LOD_TF",   LOD,         "C1+C4",  FALSE,       # matches fig_LOD_TF top-right
+                      "LOD_TF",   LOD,         "NE",     TRUE,         # matches fig_LOD_TF bottom-left
+                      "LOD_TF",   LOD,         "NE",     FALSE)         # matches fig_LOD_TF bottom-right
+
+lod_gene_lists <- lod_params %>%
+  mutate(filter_lab = if_else(tf_only, "TF_only", "all_proteins"),
+         sheet_name = sprintf("%s_%s_%s", list_name, str_replace(scope, "\\+", ""), filter_lab),
+         gene_table = pmap(list(list_name, list_genes, scope, tf_only), get_venn4_gene_lists))
+
+# Export: 8 sheets (4 for LOD_all, 4 for LOD TF-only)
+wb_lod <- createWorkbook()
+hdr    <- createStyle(fontColour = "white", fgFill = "#1F4E78", textDecoration = "bold")
+
+for (i in seq_len(nrow(lod_gene_lists))) {
+  sn   <- lod_gene_lists$sheet_name[i]
+  wide <- make_wide_gene_table(lod_gene_lists$gene_table[[i]])
+  addWorksheet(wb_lod, sn)
+  writeData(wb_lod, sn, wide, headerStyle = hdr)
+  freezePane(wb_lod, sn, firstRow = TRUE, firstActiveRow = 3)
+  setColWidths(wb_lod, sn, cols = 1:ncol(wide), widths = 20)
+}
+
+saveWorkbook(wb_lod,
+             file.path(plots_dir, "LOD_Venn4_intersection_gene_lists.xlsx"),
+             overwrite = TRUE)
+
+```
+
+```{r}
+# Per-protein, per-cell, per-condition mean count for every gene in EOD ∪ LOD
+target_long <- counts_raw %>%
+  mutate(gs = toupper(str_trim(Gene_Symbol))) %>%
+  filter(gs %in% c(EOD_all, LOD_all)) %>%
+  pivot_longer(cols = matches("^(HOS|MG63|U2OS)_(C1|C4|NE)_rep[1-4]$"),
+               names_to = "sample", values_to = "count") %>%
+  separate(sample, c("cell_line","condition","rep"),
+           sep = "_", remove = FALSE) %>%
+  mutate(rep        = as.integer(str_remove(rep, "rep")),
+         cell_line  = factor(cell_line, levels = CELL_LINES),
+         condition  = factor(condition, levels = c("NE","C4","C1")))
+
+# Curated set of TFs that demonstrate "catTFRE recovers TFs better than NE".
+SHOWCASE <- c("GTF2I","TRPS1","SP1","TEAD1","TEAD4","JUND","JUN","FOSL2")
+SHOWCASE_CELL_ORDER <- c("MG63", "U2OS", "HOS")
+# ============================================================================
+# Pool C1 + C4 into a single 8-rep "pulldown" group
+# ============================================================================
+showcase_reps <- target_long %>%
+  filter(Gene_Symbol %in% SHOWCASE) %>%
+  mutate(scope = factor(ifelse(condition == "NE", "NE", "Pulldown\n(C1+C4)"),
+                        levels = c("NE", "Pulldown\n(C1+C4)")),
+         Gene_Symbol = factor(Gene_Symbol, levels = SHOWCASE),
+         cell_line   = factor(as.character(cell_line),
+                              levels = SHOWCASE_CELL_ORDER))
+# ============================================================================
+# Summary statistics
+# ============================================================================
+showcase_summary <- showcase_reps %>%
+  group_by(Gene_Symbol, cell_line, scope) %>%
+  summarise(mean_count = mean(count),
+            sd_count   = sd(count),
+            n_reps     = n(),
+            .groups = "drop")
+# ============================================================================
+# Welch's t-test
+# ============================================================================
+showcase_pvals <- showcase_reps %>%
+  group_by(Gene_Symbol, cell_line) %>%
+  summarise(p = tryCatch(t.test(count[scope == "Pulldown\n(C1+C4)"],
+                                count[scope == "NE"],alternative = "greater")$p.value,
+                         error = function(e) NA_real_),
+            .groups = "drop")
+# ============================================================================
+# Format p-values
+# ============================================================================
+format_p <- function(p) {
+  if (is.na(p)) return("p = NA")
+  if (p < 0.001) {return("p < 0.001")}
+  paste0("p = ", signif(p, 2))
+}
+# ============================================================================
+# Coordinates for brackets and p-values
+# ============================================================================
+showcase_brackets <- showcase_summary %>%
+  group_by(Gene_Symbol, cell_line) %>%
+  summarise(ymax = max(mean_count + sd_count, na.rm = TRUE),
+            .groups = "drop") %>%
+  left_join(showcase_pvals,by = c("Gene_Symbol", "cell_line")) %>%
+  mutate(label = vapply(p, format_p, character(1)),
+    # positions of the two bars
+    x_center = as.numeric(factor(cell_line)),
+    x1 = x_center - 0.20,
+    x2 = x_center + 0.20,
+    # bracket heights
+    y = ymax * 1.4,
+    y_text = ymax * 1.5)
+# ============================================================================
+# Plot
+# ============================================================================
+SCOPE_COLOURS <- c("NE" = "#1f77b4", "Pulldown\n(C1+C4)" = "#d62728")
+
+p_showcase <- ggplot(showcase_summary, aes(cell_line, mean_count, colour = scope)) +
+  # bars
+  geom_col(aes(group = scope),position = position_dodge(0.78),width = 0.72,fill = "white",linewidth = 1) +
+  #geom_col(position = position_dodge(0.78),width = 0.72,color = "black",linewidth = 0.3) +
+  # error bars
+  geom_errorbar(aes(ymin = pmax(mean_count - sd_count, 0),
+                    ymax = mean_count + sd_count),
+                position = position_dodge(0.78),width = 0.18,linewidth = 0.4) +
+  # replicate points
+  geom_jitter(data = showcase_reps,aes(y = count, group = scope),
+              position = position_jitterdodge(jitter.width = 0.18,dodge.width  = 0.78,seed = 1),
+              size = 0.9,color = "black",alpha = 0.85) +
+  # mean labels
+  geom_text(aes(label = sprintf("%.1f", mean_count),
+                y = mean_count + sd_count +0.04 * max(showcase_summary$mean_count +showcase_summary$sd_count,na.rm = TRUE)),
+            position = position_dodge(0.78),size = 2.4) +
+  # horizontal line
+  geom_segment(data = showcase_brackets,
+               aes(x = x1,xend = x2,y = y,yend = y),
+               inherit.aes = FALSE,linewidth = 0.4) +
+  # p-value text
+  geom_text(data = showcase_brackets,
+            aes(x = x_center,y = y_text,label = label),
+            inherit.aes = FALSE,size = 2.8,fontface = "bold") +
+  # facets
+  facet_wrap(~ Gene_Symbol,scales = "free_y",nrow = 2) +
+  # colours
+  scale_colour_manual(values = SCOPE_COLOURS, name = NULL)+
+  # labels
+  labs(title = "Selected EOD/LOD TFs — catTFRE pulldown (C1+C4, 8 reps) vs nuclear extract (NE, 4 reps)",
+       subtitle = "Pooling C1+C4 doubles the n per pulldown bar and makes the catTFRE > NE advantage explicit",
+       x = NULL,y = "Spectral count") +
+  # theme
+  theme_classic(base_size = 10) +
+  theme(strip.background = element_rect(fill = "grey92",color = NA),
+        strip.text = element_text(face = "bold",size = 11),
+        axis.text.x = element_text(face = "bold",size = 9),
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9,color = "grey25"),
+        legend.position = "right")
+p_showcase
+# ============================================================================
+# Save
+# ============================================================================
+ggsave(file.path(plots_dir, "EOD_LOD_catTFRE_advantage.pdf"),p_showcase,width = 14, height = 7)
+```
+
+# Session info
+
+```{r session}
+sessionInfo()
+```
