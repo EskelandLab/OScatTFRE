@@ -1,0 +1,81 @@
+#!/bin/bash 
+
+# mkdir -p ${ANANSE_outdir}
+#conda config --add channels bioconda
+#conda config --add channels conda-forge
+#conda create -n ANANSE_python3.10_env ananse python=3.10 -y
+#conda activate ANANSE_python3.10_env
+# genomepy install hg38 --provider UCSC --annotation
+# conda remove -n ANANSE_python3.10_env --all
+
+source /cluster/projects/nn9632k/thangnx/software/miniconda3/bin/activate ANANSE_python3.10_env
+#                --histone-bams ${ChIPseq_BAM}/SRP091382_U2OS_H3K27Ac_hg38_final.bam \
+#
+# 1. Predict HOS the binding sites
+# Predict HOS the binding sites
+ananse binding --atac-bams ${ATACseq_BAM}/HOS_DMSO_rep1_hg38_final.bam ${ATACseq_BAM}/HOS_DMSO_rep2_hg38_final.bam \
+               --regions ${GENRICH_Peakcalling}/HOS_DMSO_rep1.narrowPeak ${GENRICH_Peakcalling}/HOS_DMSO_rep2.narrowPeak \
+               --histone-bams ${ChIPseq_BAM}/PRJNA299597_HOS_H3K27Ac_hg38_final.bam \
+               --genome hg38 \
+               --outdir ${ANANSE_outdir}/HOS_ATAC_K27Ac_binding
+
+# Predict U2OS the binding sites
+ananse binding --atac-bams ${ATACseq_BAM}/U2OS_DMSO_rep1_hg38_final.bam ${ATACseq_BAM}/U2OS_DMSO_rep2_hg38_final.bam \
+               --regions ${GENRICH_Peakcalling}/U2OS_DMSO_rep1.narrowPeak ${GENRICH_Peakcalling}/U2OS_DMSO_rep2.narrowPeak \
+               --histone-bams ${ChIPseq_RE}/U2OS_H3K27Ac_DMSO_rep1_hg38_final.bam ${ChIPseq_RE}/U2OS_H3K27Ac_DMSO_rep2_hg38_final.bam \
+               --genome hg38 \
+               --outdir ${ANANSE_outdir}/U2OS_ATAC_K27Ac_binding
+# Predict MG63 the binding sites
+ananse binding --atac-bams ${ATACseq_BAM}/MG63_DMSO_rep1_hg38_final.bam ${ATACseq_BAM}/MG63_DMSO_rep2_hg38_final.bam \
+               --regions ${GENRICH_Peakcalling}/MG63_DMSO_rep1.narrowPeak ${GENRICH_Peakcalling}/MG63_DMSO_rep2.narrowPeak \
+               --histone-bams ${ChIPseq_BAM}/PRJNA299597_MG63_H3K27Ac_hg38_final.bam \
+               --genome hg38 \
+               --outdir ${ANANSE_outdir}/MG63_ATAC_K27Ac_binding
+
+# 2. Ananse networks
+ananse network   ${ANANSE_outdir}/U2OS_ATAC_K27Ac_binding/binding.h5 \
+                 --expression ${RNAseq_ourdir}/RNAseq_U2OS_TPMcount_Osteosarcoma.txt \
+                 --column U2OS_1 U2OS_2 U2OS_3 U2OS_4 \
+                 --genome hg38 \
+                 --ncore 8 \
+                 --include-promoter --include-enhancer \
+                 --outfile ${ANANSE_outdir}/ANANSE_U2OS_network.tsv
+
+ananse network   ${ANANSE_outdir}/HOS_ATAC_K27Ac_binding/binding.h5 \
+                 --expression ${RNAseq_ourdir}/RNAseq_HOS_TPMcount_Osteosarcoma.txt \
+                 --column HOS_1 HOS_2 HOS_3 HOS_4 \
+                 --genome hg38 \
+                 --ncore 8 \
+                 --include-promoter --include-enhancer \
+                 --outfile ${ANANSE_outdir}/ANANSE_HOS_network.tsv
+
+ananse network   ${ANANSE_outdir}/MG63_ATAC_K27Ac_binding/binding.h5 \
+                 --expression ${RNAseq_ourdir}/RNAseq_MG63_TPMcount_Osteosarcoma.txt \
+                 --column MG63_1 MG63_2 MG63_3 MG63_4 \
+                 --genome hg38 \
+                 --ncore 8 \
+                 --include-promoter --include-enhancer \
+                 --outfile ${ANANSE_outdir}/ANANSE_MG63_network.tsv
+
+# 3. Ananse influence
+ananse influence  --source ${ANANSE_outdir}/ANANSE_MG63_network.tsv \
+                  --target ${ANANSE_outdir}/ANANSE_HOS_network.tsv \
+                  --degenes ${RNAseq_ourdir}/RNAseq_DEGs_HOS_MG63_p0.05.txt \
+                  --outfile ${ANANSE_outdir}/ANANSE_HOS_MG63_influence/ANANSE_HOS_MG63_influence.tsv \
+                  --ncore 8
+
+ananse influence  --source ${ANANSE_outdir}/ANANSE_MG63_network.tsv \
+                  --target ${ANANSE_outdir}/ANANSE_U2OS_network.tsv \
+                  --degenes ${RNAseq_ourdir}/RNAseq_DEGs_U2OS_MG63_p0.05.txt \
+                  --outfile ${ANANSE_outdir}/ANANSE_U2OS_MG63_influence/ANANSE_U2OS_MG63_influence.tsv \
+                  --ncore 8
+# 4. ananse plot
+ananse plot   ${ANANSE_outdir}/ANANSE_U2OS_MG63_influence/ANANSE_U2OS_MG63_influence.tsv  \
+              --diff-network ${ANANSE_outdir}/ANANSE_U2OS_MG63_influence/ANANSE_U2OS_MG63_influence_diffnetwork.tsv \
+              --full-output \
+              --outdir ${ANANSE_outdir}/ANANSE_U2OS_MG63_influence
+              
+ananse plot   ${ANANSE_outdir}/ANANSE_HOS_MG63_influence/ANANSE_HOS_MG63_influence.tsv  \
+              --diff-network ${ANANSE_outdir}/ANANSE_HOS_MG63_influence/ANANSE_HOS_MG63_influence_diffnetwork.tsv \
+              --full-output \
+              --outdir ${ANANSE_outdir}/ANANSE_HOS_MG63_influence
