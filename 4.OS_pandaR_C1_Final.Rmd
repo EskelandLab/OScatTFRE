@@ -1,0 +1,828 @@
+---
+title: "Osteosarcoma_TFnetworks using PANDAR (netZooR)"
+author: "NguyenXuanThang"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+vignette: >
+  %\VignetteIndexEntry{pandaR}
+  %\VignetteEngine{knitr::rmarkdown}
+  \usepackage[utf8]{inputenc}
+---
+## Introduction
+The fundamental concepts behind the PANDA approach is to model the regulatory network as a bipartite network and estimate edge weights based on the evidence that information from a particular transcription factor *i* is successfully being passed to a particular gene *j*. 
+ 
+### 1. Load packages
+An example dataset derived from a subset of stress-induced Yeast is available by running
+```{r setup, include=FALSE}
+# devtools::install_github("netZoo/netZooR", build_vignettes = TRUE)
+library("netZooR")     # load panda, condor, alpaca, lioness
+library("data.table") # To load data 
+library("openxlsx")
+library("topGO")
+library("dplyr")
+library('fgsea')       # for enrichment analysis
+library('ggplot2')     # for plotting
+library('reshape2')    # to resize data frames
+library('limma')       # to compute differential targeting
+library('viridisLite') # plot communities
+library('visNetwork')  # for network visualization
+library('RCy3')
+library("tibble")
+library("ggrastr")
+library("readxl")
+
+root_dir <- rprojroot::find_root(rprojroot::has_dir("PANDA_C1"))
+analysis_dir <- file.path(root_dir, "PANDA_C1")
+plots_dir <- file.path(analysis_dir, "PANDA_plots")
+if (!dir.exists(plots_dir)) {
+  dir.create(plots_dir, recursive = TRUE)
+}
+if (!dir.exists(analysis_dir)) {
+  dir.create(analysis_dir, recursive = TRUE)
+}
+```
+
+## 2. Data preparation 
+The HOS function in pandaR is called with
+1. prior A "prior" regulatory network of putative TF-gene interactions. Here, we will be working with a motif prior that we previously built by scanning known TF motifs to promoter regions in the human genome. In this file, the first column indicates the TF, the second column the target gene, and the third column a "1" indicating a putative interaction. Download at: https://sites.google.com/a/channing.harvard.edu/kimberlyglass/tools/resources
+2. exp Gene expression data. Gene expression data and gene annotations were retrieved from MS data. This dataset contains gene expression data obtained from microarrays that were used to profile HOS and low_aggMG63rent brain cancer. These data were downloaded with the R package GEOquery and then normalized and log transformed. Rows indicate probe IDs and columns sample names.
+3. ppi Potential protein-protein interactions (PPI) between TFs (optional). PPI data is optional in PANDA. Here, we downloaded data from StringDb, which contains scores in the range of [0,1000] indicating potential PPIs. We filtered these for TFs present in the motif prior and transformed scores to scores [0,1]. The first column indicates a TF, the second the TF it binds, and the third the interaction score.
+
+## 2. Data preparation 
+The HOS function in pandaR is called with
+1. prior A "prior" regulatory network of putative TF-gene interactions. Here, we will be working with a motif prior that we previously built by scanning known TF motifs to promoter regions in the human genome. In this file, the first column indicates the TF, the second column the target gene, and the third column a "1" indicating a putative interaction. Download at: https://sites.google.com/a/channing.harvard.edu/kimberlyglass/tools/resources
+2. exp Gene expression data. Gene expression data and gene annotations were retrieved from MS data. This dataset contains gene expression data obtained from microarrays that were used to profile HOS and low_aggMG63rent brain cancer. These data were downloaded with the R package GEOquery and then normalized and log transformed. Rows indicate probe IDs and columns sample names.
+3. ppi Potential protein-protein interactions (PPI) between TFs (optional). PPI data is optional in PANDA. Here, we downloaded data from StringDb, which contains scores in the range of [0,1000] indicating potential PPIs. We filtered these for TFs present in the motif prior and transformed scores to scores [0,1]. The first column indicates a TF, the second the TF it binds, and the third the interaction score.
+
+```{r}
+# Load the background data, keep at least 50% of data that appear in CRAPome
+U2OS_CRAPome <- read.xlsx(file.path(root_dir,"CrapDB_U2OS_StrepHA.xlsx"), rowNames = T)
+U2OS_CRAPome <- U2OS_CRAPome %>% dplyr::filter(NUM_EXPT > 1.5 & AVE_SC > 3) # 3 U2OS samples
+
+# Load the raw count
+catTFRE_MS_Round4 <- read_excel(file.path(root_dir,"catTFRE_Round4_HOS_MG63_U2OS_Thang.xlsx"), sheet = 1)
+# Extract the sample column
+sample_cols <- grep("^(HOS|MG63|U2OS)_(C1)_rep[1-4]$", colnames(catTFRE_MS_Round4), value = TRUE)
+stopifnot("Need exactly 24 sample columns" = length(sample_cols) == 12)
+
+sample_cols <- grep("^(HOS|MG63|U2OS)_(C1)_rep[1-4]$",
+                    colnames(catTFRE_MS_Round4),
+                    value = TRUE)
+# Keep rows with at least 1 non-zero values and remove the back ground
+exp <- catTFRE_MS_Round4[rowSums(catTFRE_MS_Round4[, sample_cols] != 0) >= 1, ] %>%
+  dplyr::filter(!Gene_Symbol %in% rownames(U2OS_CRAPome)) %>%
+  dplyr::select(Gene_Symbol, all_of(sample_cols))
+
+# To begin, we will calculate the standard deviation of the rows, and connect that to the original expression matrix:
+rowsd <- apply(exp[, 1:12], 1, sd)
+exp <- cbind(rowsd, exp)
+rm(rowsd)
+# Let's sort the expression data based on the standard deviation of each probe, so that the most variable entries will be on the top.
+exp <- exp[order(exp$rowsd, decreasing=T),]
+# In R, row names must be unique. Therefore, we need to remove duplicated genes from our expression matrix. we will do this by, for each gene, choosing to keep the probe ID that has the highest variance across samples. Now, continue remove duplicate gene symbols with low variance (gene name with low variance sorted bottom of list that duplicated will be removed)
+exp <- exp[!duplicated(exp$Gene_Symbol), ]
+# Set Gene_Symbol as rownames
+rownames(exp) <- exp[, "Gene_Symbol"]
+nrow(exp)
+# Remove colname not to be used
+exp <- exp %>% dplyr::select(-rowsd, -Gene_Symbol) # exp <- exp[, -c(1,13:15)]
+# Change the colnames
+colnames(exp) <- c(rep(paste0("HOS_", 1:4)), rep(paste0("MG63_", 1:4)), rep(paste0("U2OS_", 1:4)))
+# colnames(exp) <- sub("#Spec.Sample.", "",colnames(exp))
+dim(exp)
+# Determine the number of non-NA/non-zero rows in the expression data. This is to be able to ensure that PANDA will have enough values in the vectors to calculate pearson correlations between gene expression profiles in the construction of the gene co-expression prior.
+zero_na_counts <- apply(exp, MARGIN = 1, FUN = function(x) length(x[(!is.na(x) & x!=0) ]))
+dim(exp[zero_na_counts > 0,])
+exp <- exp[zero_na_counts > 0,]
+write.table(exp, file = "protein_MS_spectral.txt" , sep = "\t", row.names = TRUE, col.names = TRUE)
+# Load the expression data
+exp <- read.delim(file.path(analysis_dir,"protein_MS_spectral.txt"), sep = "\t", header = TRUE)
+length(unique(rownames(exp)))
+
+
+## motif dataset prior: the first column indicates the TF, the second column as the target gene, and the third column indicating a putative interaction.
+# motif <- read.delim("prior_motif_hg38_refseq.txt", stringsAsFactors=FALSE, header=FALSE)
+# Merge motif info and motif name
+# motif_info <- read.delim("prior_motifinfo_Homo_sapiens.txt", stringsAsFactors=FALSE, header=TRUE)
+# motif_info[, 1] <- sapply(strsplit(as.character(motif_info[, 1]), "\\_"), "[", 1)
+# motif_info[, 2] <- sapply(strsplit(as.character(motif_info[, 2]), "\\_"), "[", 1)
+# motif_info[, 2] <- gsub("\\*|\\(|\\)", "", motif_info[, 2])
+# motif <- merge(motif_info, motif, by.x="MotifID", by.y="V1",  all.y =TRUE)
+# motif <- motif[, -1]
+# table(duplicated(motif[,1])) #dplyr::count() for column in dataframe, table for logical TRUE/FALSE
+# write.table(motif, file = "prior_motif_hg38data.txt" , sep = "\t", row.names = FALSE, col.names = TRUE)
+motif <- read.delim(file.path(analysis_dir,"prior_motif_hg38data.txt"), stringsAsFactors=FALSE, header=TRUE)
+
+
+## Protein protein interaction data: The first column indicates a TF, the second are the TF it binds, and the third as the interaction score.
+# https://string-db.org/cgi/download?sessionId=bPWghZV6jLBS&species_text=Homo+sapiens
+# ppi <- read.delim("9606.protein.links.v12.0.txt", sep = "", stringsAsFactors = F)
+# ppi_list <- read.delim("9606.protein.info.v12.0.txt", sep = "\t", stringsAsFactors = F)
+# Add protein name
+# ppi <- merge(ppi, ppi_list[, 1:2], by.x="protein1", by.y="X.string_protein_id", all=TRUE)
+# ppi <- merge(ppi, ppi_list[, 1:2], by.x="protein2", by.y="X.string_protein_id", all=TRUE)
+# select based on column name data
+# ppi <- ppi %>% select(preferred_name.x, preferred_name.y, combined_score)
+# colnames(ppi) <- c("protein1", "protein2", "score")
+# ppi <- ppi[!is.na(ppi[, 1]), ]
+# ppi <- ppi[!is.na(ppi[ ,2]), ]
+# ppi[, 1] <- sapply(strsplit(as.character(ppi[, 1]), "\\_"), "[", 1)
+# ppi[, 2] <- sapply(strsplit(as.character(ppi[, 2]), "\\_"), "[", 1)
+# transformed scores [0:1000] to scores [0,1]
+# ppi[ , 3] <- ppi[, 3]/1000
+# How many unique TFs are present in the PPI data?
+# length(unique(c(ppi[ , 1], ppi[ , 2])))
+# write.table(ppi, file = "protein_interaction_STRING_All.txt" , sep = "\t", row.names = FALSE, col.names = TRUE)
+ppi <- read.delim(file.path(analysis_dir,"protein_interaction_STRING_All.txt"), sep = "\t", header = T, stringsAsFactors = F)
+
+## In PANDA, row names from the gene expression dataset should match names of gene targets in the motif prior (second row in the motif prior). Here, we will pre-filter data before running PANDA, we subset our data to only include information common to both the motif prior and the gene expression data (same set of genes) and the motif prior and PPI (same set of TFs).
+## Filtering the network that only included protein in the expression data
+## How many genes are in common between the motif prior and expression data?
+length(intersect(motif[ , 1], rownames(exp)))
+length(intersect(motif[ , 2], rownames(exp)))
+motif <- motif[motif[ , 1]  %in% rownames(exp), ]
+motif <- motif[which(motif[, 2] %in% rownames(exp)),]
+length(unique(motif[, 1])) # unique TFs in motif data
+length(unique(motif[, 2])) # unique genes in motif data
+
+## To do the matching we first find the gene names that are common to both the motif prior and expression data and then filter both to only contain information for these genes.
+exp <- exp[which(rownames(exp) %in% motif[ , 2]),]
+# length(unique(rownames(exp)))
+
+## Protein-protein interaction data
+## Filtering the network that only included protein in the expression data
+ppi <- ppi[ppi[ , 1]  %in% rownames(exp), ]
+ppi <- ppi[ppi[ , 2]  %in% rownames(exp), ]
+dim(ppi)
+write.table(ppi, file = file.path(analysis_dir,"protein_interaction_MassSpec_filtering.txt"), sep = "\t", row.names = FALSE, col.names = TRUE)
+
+## Now do the same for TFs in the motif prior and PPI data. How many TFs are in common? remember that ppi data is TFs-TFs, so that both column 1 and 2 will be TFs
+length(intersect(unique(motif[, 1]), unique(c(ppi[, 1], ppi[, 2])))) # 258
+# matching TFs
+commonTFs <- intersect(motif[, 1], c(ppi[, 1], ppi[, 2]))
+motif <- motif[which(motif[, 1] %in% commonTFs),]
+ppi <- ppi[which(ppi[, 1] %in% commonTFs & ppi[, 2] %in% commonTFs),]
+length(unique(ppi[, 1]))
+length(unique(ppi[, 2]))
+write.table(ppi, file = file.path(analysis_dir, "protein_interaction_MassSpec_ppi_filtering.txt"), sep = "\t", row.names = FALSE, col.names = TRUE)
+
+ppi <- read.delim(file.path(analysis_dir, "protein_interaction_MassSpec_ppi_filtering.txt") , sep = "\t", header = T, stringsAsFactors = F)
+# ppi <- read.delim("protein_interaction_MassSpec_filtering.txt" , sep = "\t", header = T, stringsAsFactors = F)
+
+
+write.table(motif, file = file.path(analysis_dir,"prior_motif_MassSpec_filtering.txt"), sep = "\t", row.names = FALSE, col.names = TRUE)
+motif <- read.delim(file.path(analysis_dir, "prior_motif_MassSpec_filtering.txt"), stringsAsFactors=FALSE, header=TRUE)
+
+
+exp <- read.delim(file.path(analysis_dir,"protein_MS_spectral_filtering.txt"), sep = "\t", header = TRUE)
+# Then, we log transform the protein expression
+exp <- log2(exp+1)
+write.table(exp, file = file.path(analysis_dir,"protein_MS_spectral_filtering_log2.txt"), sep = "\t", row.names = TRUE, col.names = TRUE)
+exp <- read.delim(file.path(analysis_dir, "protein_MS_spectral_filtering_log2.txt"), sep = "\t", header = TRUE)
+
+
+```
+
+## 3. Running PANDA on OS cell type HOS, U2OS and MG63
+In the previous module, we modeled one aggregate regulatory network on the entire expression dataset. Here, we will focus on comparative network analysis between (1) two aggregate networks; and (2) single-sample networks. To do so, we need to start looking at the clinical data. Clinical features associated with our expression dataset can be found in the clin object.
+
+#### 3.1. Data classification
+```{r PANDA, include=FALSE}
+
+# extract column of expression data order by cell type
+exp_HOS <- exp[ , grepl("HOS", colnames(exp))] 
+zero_na_counts <- apply(exp, MARGIN = 1, FUN = function(x) length(x[(!is.na(x) & x!=0) ]))
+dim(exp_HOS[zero_na_counts > 4,]) 
+exp_HOS <- exp_HOS[zero_na_counts > 4,]
+motif_HOS <- motif[motif[ , 1]  %in% rownames(exp_HOS), ]
+motif_HOS <- motif_HOS[which(motif_HOS[, 2] %in% rownames(exp_HOS)),]
+## Filtering the network that only included protein in the expression data
+ppi_HOS <- ppi[ppi[ , 1]  %in% rownames(exp_HOS), ]
+ppi_HOS <- ppi_HOS[ppi_HOS[ , 2]  %in% rownames(exp_HOS), ]
+## Then run PANDA on both datasets with default parameters. 
+net_HOS <- panda(motif_HOS, exp_HOS, ppi_HOS, progress = T) #39 steps, 3816 Genes and 202 TFs. Time elapsed:168.88seconds.
+RegNet_HOS <- slot(net_HOS, "regNet")
+
+## U2OS
+exp_U2OS <- exp[ , grepl("U2OS", colnames(exp))] 
+zero_na_counts2 <- apply(exp_U2OS, MARGIN = 1, FUN = function(x) length(x[(!is.na(x) & x!=0) ]))
+dim(exp_U2OS[zero_na_counts > 4,]) 
+exp_U2OS <- exp_U2OS[zero_na_counts > 4,]
+motif_U2OS <- motif[motif[ , 1]  %in% rownames(exp_U2OS), ]
+motif_U2OS <- motif_U2OS[which(motif_U2OS[, 2] %in% rownames(exp_U2OS)),]
+## Filtering the network that only included protein in the expression data
+ppi_U2OS <- ppi[ppi[ , 1]  %in% rownames(exp_U2OS), ]
+ppi_U2OS <- ppi_U2OS[ppi_U2OS[ , 2]  %in% rownames(exp_U2OS), ]
+## Then run PANDA on both datasets with default parameters. 
+net_U2OS <- panda(motif_U2OS, exp_U2OS, ppi_U2OS, progress = T) #39 steps, Successfully ran PANDA on 4662 Genes and 198 TFs. Time elapsed:251.88seconds
+RegNet_U2OS <- slot(net_U2OS, "regNet") 
+
+## MG63
+exp_MG63 <- exp[ , grepl("MG63", colnames(exp))] 
+zero_na_counts3 <- apply(exp_MG63, MARGIN = 1, FUN = function(x) length(x[(!is.na(x) & x!=0) ]))
+dim(exp_MG63[zero_na_counts > 4,]) 
+exp_MG63 <- exp_MG63[zero_na_counts > 4,]
+motif_MG63 <- motif[motif[ , 1]  %in% rownames(exp_MG63), ]
+motif_MG63 <- motif_MG63[which(motif_MG63[, 2] %in% rownames(exp_MG63)),]
+## Filtering the network that only included protein in the expression data
+ppi_MG63 <- ppi[ppi[ , 1]  %in% rownames(exp_MG63), ]
+ppi_MG63 <- ppi_MG63[ppi_MG63[ , 2]  %in% rownames(exp_MG63), ]
+## Then run PANDA on both datasets with default parameters. 
+net_MG63 <- panda(motif_MG63, exp_MG63, ppi_MG63, progress = T) #40 steps, Successfully ran PANDA on 4463 Genes and 205 TFs. Time elapsed:227.47seconds.
+RegNet_MG63 <- slot(net_MG63, "regNet") 
+
+# Save an object to a file: save() with rda extension will contain multiple file
+save(net_HOS, RegNet_HOS, net_U2OS, RegNet_U2OS, net_MG63, RegNet_MG63, ppi, motif, exp, file = file.path(analysis_dir, "PANDA_eachcelltype_filtering_celltype_NEW.rda"))
+
+```
+
+
+## 3. Running PANDA on OS cell type HOS, U2OS and MG63
+In the previous module, we modeled one aggregate regulatory network on the entire expression dataset. Here, we will focus on comparative network analysis between (1) two aggregate networks; and (2) single-sample networks. To do so, we need to start looking at the clinical data. Clinical features associated with our expression dataset can be found in the clin object.
+
+#### 3.2 Comparing two PANDA networks
+# Now we are ready to compare the two PANDA networks. The panda() function in netZooR outputs each network of a matrix, with TFs in rows and their target genes in columns. 
+```{r COMPARE}
+# Restore the object
+load(file = file.path(analysis_dir, "PANDA_eachcelltype_filtering_celltype_NEW.rda"))
+
+# To easily visualize differential edges and the TFs and genes connected to them, we will transform this into an edgelist using the code below. 
+length(c(RegNet_HOS))
+length(c(RegNet_U2OS))
+length(c(RegNet_MG63))
+tfnamerep_HOS <- rep(row.names(RegNet_HOS), ncol(RegNet_HOS)) 
+genenamerep_HOS <- rep(colnames(RegNet_HOS), each=nrow(RegNet_HOS)) 
+# We first combine the TF and gene names in the same order as the c() function in R unlists matrices, and convert that into a data.frame.
+edgelist_HOS <- cbind(tfnamerep_HOS, genenamerep_HOS) 
+edgelist_HOS <- as.data.frame(edgelist_HOS)
+# Now, we are ready to attach the edges in the HOS and low_aggMG63rent networks to this edge list. 
+edgelist <- cbind(edgelist_HOS, c(RegNet_HOS), c(RegNet_U2OS), c(RegNet_MG63)) 
+colnames(edgelist) <- c("TF","Gene","HOS", "U2OS","MG63")
+
+# then we will select edges that are both likely to be "real" in a particular network (i.e. have a high edge weight) as well as "different" between the two networks. Because the weights of PANDA edges can be thought of as z-score units, edgeweights can be easily converted into probability values.
+p_high_aggHOS <- pnorm(RegNet_HOS) 
+p_high_aggU2OS <- pnorm(RegNet_U2OS) 
+p_low_aggMG63 <- pnorm(RegNet_MG63) 
+# then select edges based on this combined probability score. In our example, we use the PANDA output matrices to select edges that have at least a 75% chance of being both real and different:
+high_aggHOS_spec <- p_high_aggHOS*pnorm(RegNet_HOS - RegNet_MG63) > 0.75
+high_aggU2OS_spec <- p_high_aggU2OS*pnorm(RegNet_U2OS - RegNet_MG63) > 0.75
+
+low_aggMG63_spec1 <- p_low_aggMG63*pnorm(RegNet_MG63 - RegNet_HOS) > 0.75
+low_aggMG63_spec2 <- p_low_aggMG63*pnorm(RegNet_MG63 - RegNet_U2OS) > 0.75
+# We can then port these to our edgelist as follows: 
+high_aggHOS_spec_edges <- edgelist[which(c(high_aggHOS_spec)) , ] 
+low_aggMG63_spec_edges1 <- edgelist[which(c(low_aggMG63_spec1)) , ]
+
+high_aggU2OS_spec_edges <- edgelist[ which(c(high_aggU2OS_spec)) ,] 
+low_aggMG63_spec_edges2 <- edgelist[which(c(low_aggMG63_spec2)) ,]
+
+# Visualize these tumor type-specific edges on top of the scatterplot you made in Q6. Hint: use point() to overlay points of different colors on the scatterplot. 
+
+# How many edges are specific to the HOS network? And to the MG63 network?
+length(unique(edgelist$TF)) #171
+length(unique(edgelist$Gene)) #3628
+library(ggplot2)
+library(ggrastr)
+high_aggHOS_spec_edges$group <- "HOS"
+low_aggMG63_spec_edges1$group <- "MG63"
+HOS_label <- paste0("HOS-specific: ", nrow(high_aggHOS_spec_edges))
+mg63_label <- paste0("MG63-specific: ", nrow(low_aggMG63_spec_edges1))
+scale_color_manual(values = c("HOS" = "#8332FF", "MG63" = "#56B4E9"))
+high_aggHOS_spec_edges$group <- "HOS-specific"
+low_aggMG63_spec_edges1$group <- "MG63-specific"
+
+plot_HOS_MG63 <- ggplot() +
+  geom_point(data = edgelist,
+             aes(x = HOS, y = MG63),color = "black",size = 0.8) +
+  ggrastr::geom_point_rast(data = high_aggHOS_spec_edges,
+                           aes(x = HOS, y = MG63, color = group),size = 1) +
+  ggrastr::geom_point_rast(data = low_aggMG63_spec_edges1,
+                           aes(x = HOS, y = MG63, color = group),size = 1) +
+  scale_color_manual(values = c("HOS-specific" = "#8332FF","MG63-specific" = "#56B4E9")) +
+  labs(color = NULL) +
+  ggtitle("Cell type-specific edges on top of HOS versus MG63 cell type edges") +
+  annotate("text",x = Inf, y = Inf,
+           label = paste0("HOS-specific: ", nrow(high_aggHOS_spec_edges),
+                          "\nMG63-specific: ", nrow(low_aggMG63_spec_edges1)),
+           hjust = 2.1, vjust = 1.2) +
+  theme_classic()
+
+plot_HOS_MG63_raster <- ggrastr::rasterise(plot_HOS_MG63, layers = "Point", dpi = 600)
+ggsave(plot_HOS_MG63_raster, file = file.path(plots_dir, "DEGs_HOS_vs_MG63_edges.pdf"), width = 6, height = 5)
+
+# Visualize these tumor type-specific edges on top of the scatterplot, use point() to overlay points of different colors on the scatterplot. 
+library(ggplot2)
+library(ggrastr)
+high_aggU2OS_spec_edges$group <- "U2OS"
+low_aggMG63_spec_edges2$group <- "MG63"
+u2os_label <- paste0("U2OS-specific: ", nrow(high_aggU2OS_spec_edges))
+mg63_label <- paste0("MG63-specific: ", nrow(low_aggMG63_spec_edges2))
+scale_color_manual(values = c("U2OS" = "#F66239", "MG63" = "#56B4E9"))
+high_aggU2OS_spec_edges$group <- "U2OS-specific"
+low_aggMG63_spec_edges2$group <- "MG63-specific"
+
+plot_U2OS_MG63 <- ggplot() +
+  geom_point(data = edgelist,
+             aes(x = U2OS, y = MG63),color = "black",size = 0.8) +
+  ggrastr::geom_point_rast(data = high_aggU2OS_spec_edges,
+                           aes(x = U2OS, y = MG63, color = group),size = 1) +
+  ggrastr::geom_point_rast(data = low_aggMG63_spec_edges2,
+                           aes(x = U2OS, y = MG63, color = group),size = 1) +
+  scale_color_manual(values = c("U2OS-specific" = "#F66239","MG63-specific" = "#56B4E9")) +
+  labs(color = NULL) +
+  ggtitle("Cell type-specific edges on top of U2OS versus MG63 cell type edges") +
+  annotate("text",x = Inf, y = Inf,
+           label = paste0("U2OS-specific: ", nrow(high_aggU2OS_spec_edges),
+                          "\nMG63-specific: ", nrow(low_aggMG63_spec_edges2)),
+           hjust = 2.1, vjust = 1.2) +
+  theme_classic()
+
+plot_U2OS_MG63_raster <- ggrastr::rasterise(plot_U2OS_MG63, layers = "Point", dpi = 600)
+ggsave(plot_U2OS_MG63_raster, file = file.path(plots_dir, "DEGs_U2OS_vs_MG63_edges.pdf"), width = 6, height = 5)
+
+# What is the TF that makes most specific interactions in each of these networks? 
+# table(high_aggHOS_spec_edges$TF)[order(table(high_aggHOS_spec_edges$TF), decreasing = TRUE)] # MBD2/MECP2 makes most interactions, 1793/1787
+# table(low_aggMG63_spec_edges1$TF)[order(table(low_aggMG63_spec_edges1$TF), decreasing = TRUE)] # SP3/ZBTB7B makes most interactions, 2020/2007
+
+# table(high_aggU2OS_spec_edges$TF)[order(table(high_aggU2OS_spec_edges$TF), decreasing = TRUE)] # EGR1 makes most interactions, 2231
+# table(low_aggMG63_spec_edges2$TF)[order(table(low_aggMG63_spec_edges2$TF), decreasing = TRUE)] # MBD2 makes most interactions, 1788
+
+# How many genes does it target? Do you recognize any of these genes?
+# RUNX2_HOS_target <- edgelist[which(c(high_aggHOS_spec)),][which(edgelist[which(c(high_aggHOS_spec)),]$TF=="RUNX2"),]$Gene
+# RUNX2_MG63_target1 <- edgelist[which(c(low_aggMG63_spec1)),][which(edgelist[which(c(low_aggMG63_spec1)),]$TF=="RUNX2"),]$Gene
+
+# RUNX2_U2OS_target <- edgelist[which(c(high_aggU2OS_spec)),][which(edgelist[which(c(high_aggU2OS_spec)),]$TF=="RUNX2"),]$Gene
+# RUNX2_MG63_target2 <- edgelist[which(c(low_aggMG63_spec2)),][which(edgelist[which(c(low_aggMG63_spec2)),]$TF=="RUNX2"),]$Gene
+
+```
+
+
+#### 4 Comparing agressive TFs between two PANDA networks
+#### 4.1 Preparing data to plot
+```{r}
+# We will use the function vis.panda.in.cytoscape to plot a set of nodes and edges on Cytoscape. The input for this function is a data.frame of edges to plot with 4 columns: "tf", "gene", "motif" (TF motif present or not on gene promoter), "force" (edge weight calculated by PANDA).
+HOS_vis <- reshape2::melt(net_HOS@regNet)
+U2OS_vis <- reshape2::melt(net_U2OS@regNet)
+MG63_vis  <- reshape2::melt(net_MG63@regNet)
+
+HOS_vis <- data.frame("TF"=as.character(HOS_vis[,1]),
+                      "Gene"=as.character(HOS_vis[,2]),
+                      "Score"=as.numeric(HOS_vis[,3]),
+                      "Motif"=NA, stringsAsFactors = FALSE)
+U2OS_vis <- data.frame("TF"=as.character(U2OS_vis[,1]),
+                      "Gene"=as.character(U2OS_vis[,2]),
+                      "Score"=as.numeric(U2OS_vis[,3]),
+                      "Motif"=NA, stringsAsFactors = FALSE)
+MG63_vis <- data.frame("TF"=as.character(MG63_vis[,1]),
+                       "Gene"=as.character(MG63_vis[,2]),
+                       "Score"=as.numeric(MG63_vis[,3]),
+                       "Motif"=NA, stringsAsFactors = FALSE)
+head(HOS_vis)
+head(U2OS_vis)
+head(MG63_vis)
+
+U2OS_MG63 <- read.xlsx(file.path(root_dir, "DEP_Plots_C1" ,"Diffenrential_Enrichment_Protein_U2OS_vs_MG63.xlsx"))
+HOS_MG63 <- read.xlsx(file.path(root_dir, "DEP_Plots_C1" ,"Diffenrential_Enrichment_Protein_HOS_vs_MG63.xlsx"))
+DEP_gene_list <- rbind(U2OS_MG63[, !"Expression"=="Not_significant" ] %>% dplyr::select(protein), 
+                       HOS_MG63[, !"Expression"=="Not_significant" ] %>% dplyr::select(protein)) %>% unique()
+# Load all TF and Epigenetics database
+TF_list <- read.xlsx(file.path(root_dir,"TFs_list_Cell2018.xlsx"))
+Epi_list <- read.xlsx(file.path(root_dir,"Epifactor_Histone_list.xlsx"))
+# Filtering the data of TFs and Epigenetic factors
+# HOS_vis_TF <- HOS_vis[HOS_vis$TF %in% DEP_gene_list$protein, ]
+HOS_vis_TF <- HOS_vis %>% filter(TF %in% DEP_gene_list$protein, 
+                                 Gene %in% DEP_gene_list$protein )
+
+HOS_vis_TF <- HOS_vis_TF %>% filter(TF %in% c(TF_list$Name), 
+                                 Gene %in% c(TF_list$Name) )
+table(HOS_vis_TF$TF)
+table(HOS_vis_TF$Gene)
+#U2OS_vis_TF <- U2OS_vis[U2OS_vis$TF %in% DEP_gene_list$protein, ]
+U2OS_vis_TF <- U2OS_vis %>% filter(TF %in% DEP_gene_list$protein, 
+                                 Gene %in% DEP_gene_list$protein )
+
+U2OS_vis_TF <- U2OS_vis_TF %>% filter(TF %in% c(TF_list$Name), 
+                                 Gene %in% c(TF_list$Name) )
+table(U2OS_vis_TF$TF)
+table(U2OS_vis_TF$Gene)
+table(HOS_vis_TF$Gene)
+# MG63_vis_TF <- MG63_vis[MG63_vis$TF %in% DEP_gene_list$protein, ]
+MG63_vis_TF <- MG63_vis %>% filter(TF %in% DEP_gene_list$protein, 
+                                 Gene %in% DEP_gene_list$protein )
+
+MG63_vis_TF <- MG63_vis_TF %>% filter(TF %in% c(TF_list$Name), 
+                                 Gene %in% c(TF_list$Name) )
+table(MG63_vis_TF$TF)
+table(MG63_vis_TF$Gene)
+
+```
+
+#### 4.2. Plot the highest edge weights each cell types
+```{r}
+nrow(HOS_vis_TF) #1573
+nrow(U2OS_vis_TF) #1573
+nrow(MG63_vis_TF)#1573
+unique(HOS_vis_TF$TF)
+
+
+n = 1000 # number of edges to plot 
+#HOS
+top_HOS <- order(HOS_vis_TF$Score,decreasing=T)[1:n]
+HOS_vis_top <- HOS_vis[top_HOS,]
+#U2OS
+top_U2OS <- order(U2OS_vis_TF$Score,decreasing=T)[1:n]
+U2OS_vis_top <- U2OS_vis[top_U2OS,]
+# MG63
+top_MG63 <- order(MG63_vis_TF$Score,decreasing=T)[1:n]
+MG63_vis_top <- MG63_vis[top_MG63,]
+## Plot in cytoscape (open Cytoscape before running this command)
+#cytoscapePing()
+#cytoscapeVersionInfo()
+visPandaInCytoscape(HOS_vis_top, network_name="HOS_TFs")
+visPandaInCytoscape(U2OS_vis_top, network_name="U2OS_TFs")
+visPandaInCytoscape(MG63_vis_top, network_name="MG63_TFs")
+
+
+
+
+# Plot the 1000 highest edge weights
+n = 1000 # number of edges to plot 
+
+#HOS
+top_HOS <- order(HOS_vis$Score,decreasing=T)[1:n]
+HOS_vis_top <- HOS_vis[top_HOS,]
+#U2OS
+top_U2OS <- order(U2OS_vis$Score,decreasing=T)[1:n]
+U2OS_vis_top <- U2OS_vis[top_U2OS,]
+# MG63
+top_MG63 <- order(MG63_vis$Score,decreasing=T)[1:n]
+MG63_vis_top <- MG63_vis[top_MG63,]
+## Plot in cytoscape (open Cytoscape before running this command)
+#cytoscapePing()
+#cytoscapeVersionInfo()
+visPandaInCytoscape(HOS_vis_top, network_name="HOS_C1_1000")
+visPandaInCytoscape(U2OS_vis_top, network_name="U2OS_C1_1000")
+visPandaInCytoscape(HOS_vis_top, network_name="MG63_C1_1000")
+# Here we will load a customized visual style for our network, in which TF nodes are orange circles, target gene nodes are blue squares, and edges shade and width are the edge weight (likelyhood of regulatory interaction between the TF and gene). You can further customize the network style directly from Cytoscape.
+# createPandaStyle(style_name="PandaStyle")
+
+```
+
+#### Copy visDiffPandaInCytoscape() and createDiffPandaStyle() function from github.
+```{r, include=FALSE}
+# https://github.com/netZoo/netZooR/blob/master/R/visDiffPandaInCytoscape.R
+visDiffPandaInCytoscape <- function(merged_panda, condition_name = "cond.1", network_name="diff.PANDA"){
+  # launch Cytoscape 3.6.1 or greater
+  cytoscapePing ()
+  cytoscapeVersionInfo ()
+  #plot
+  colnames(merged_panda) <- c("source","target","motif","weight",condition_name)
+  merged_panda$weight_transformed <- rank(merged_panda$weight)/length(merged_panda$weight)*10000
+  if(nrow(merged_panda)>6666){message("The maximum network objects (nodes+edges) that Cytoscape could support varies in different memories.
+          0-20000 objects are suggested by 512M memory size for Cytoscape to view. 
+          For better view function in Cytoscape please reduce the size of PANDA network imported")}
+  #create nodes arg for creating a cytoscape plot
+  panda_nodes <- data.frame(id=c(merged_panda$source,merged_panda$target), group=rep(c("TF","Gene"), each=nrow(merged_panda)),stringsAsFactors=FALSE)
+  # creat cytoscape from DataFrames
+  createNetworkFromDataFrames(nodes=panda_nodes,edges=merged_panda, title=network_name, collection="DataFrame Example")
+  }
+
+# Plot the single network https://github.com/netZoo/netZooR/blob/master/R/createPandaStyle.R
+# Plot the differential network https://github.com/netZoo/netZooR/blob/master/R/createDiffPandaStyle.R
+createDiffPandaStyle <- function(style_name="Diff.PandaStyle", condition_name="cond.1"){
+  # node properties
+  nodeShape <- mapVisualProperty('node shape','group','d',
+                                 c("TF","Gene"),
+                                 c("ELLIPSE","RECTANGLE"))
+  nodeColor <- mapVisualProperty('node fill color', 'group','d', 
+                                 c("TF","Gene"), 
+                                 c('#FD7622', '#499df3'))
+  nodeBorderColor <- mapVisualProperty("Node Border Paint", 'group', 'd', 
+                                       c("TF","Gene"), 
+                                       c('#FD7622', '#499df3'))
+  nodeLabel <- mapVisualProperty("node label","id",'p')
+  # edge properties
+  edgeLineType <- mapVisualProperty('edge line type','motif','d',c(1,0), 
+                                    c("SOLID","LONG_DASH"))
+  edgeTargetArrowShape <- mapVisualProperty("edge target arrow shape",'motif','d',c(1,0),c("DELTA","DELTA"))
+  edgeTargetArrowUnSelectedPaint <- mapVisualProperty("Edge Target Arrow Unselected Paint",
+                                                      condition_name,'d',c("T","F"), 
+                                                      c('#92278f', '#60bf71'))
+  # edge width and edge color shade both represent the edge weight.
+  edgeWidth <- mapVisualProperty("edge width", "weight_transformed",'c', c(0,10000), c(0.5,7))
+  edgeStrokeUnselectedPaint <- mapVisualProperty('Edge Stroke Unselected Paint',
+                                                 condition_name,'d',c("T","F"), 
+                                                 c('#92278f', '#60bf71'))
+  # default setting
+  defaults <- list(NODE_SIZE=50,
+                   EDGE_TRANSPARENCY=255,
+                   NODE_LABEL_POSITION="center")
+  # create visual style working for PANDA network
+  createVisualStyle(style_name,defaults,list(nodeShape, nodeColor, nodeBorderColor,nodeLabel,
+                                             edgeLineType, edgeTargetArrowShape, edgeTargetArrowUnSelectedPaint,
+                                             edgeWidth, edgeStrokeUnselectedPaint))
+}
+
+```
+
+#### 4.3. Plot the highest differential networks betweeen TF High Agressive (HOS/U2OS) versus Low Agressive (MG63)
+```{r}
+## Plot differential networks betweeen HOS (High Agressive) versus MG63 (Low Agressive)
+# Select the top differential edge weights betweeen HOS and MG63
+diffRes_HOS_MG63_TF <- pandaDiffEdges(HOS_vis_TF, MG63_vis_TF, threshold=0.8, condition_name="High_Agressive")
+## Plot differential networks betweeen U2OS (High Agressive) versus MG63 (Low Agressive)
+diffRes_U2OS_MG63_TF <- pandaDiffEdges(U2OS_vis_TF, MG63_vis_TF, threshold=0.8, condition_name="High_Agressive")
+
+# Number of differential edges is:
+nrow(diffRes_HOS_MG63_TF) # 19623 #108
+nrow(diffRes_U2OS_MG63_TF) # 20022  #123
+
+#  Apply the style to the network. Purple edges indicate higher edge weight in the defined "condition_name" parameter (HOS in our example), and green edges indicate higher edge weight in the other condition (MG63 in our example).
+# createDiffPandaStyle(style_name="Diff.PandaStyle", condition_name="High_Agressive")
+
+# Select the top differential edges higher in HOS to plot in Cytoscape
+n=100 # number of edges to select from each condition
+diffResHOS_TF <- diffRes_HOS_MG63_TF[diffRes_HOS_MG63_TF$High_Agressive=="T",]
+diffResHOS_TF <- diffResHOS_TF[order(diffResHOS_TF$Score,decreasing=TRUE),][1:n,]
+# Select the top differential edges higher in MG63 to plot in Cytoscape
+diffResMG63_TF1 <- diffRes_HOS_MG63_TF[diffRes_HOS_MG63_TF$High_Agressive=="F",]
+diffResMG63_TF1 <- diffResMG63_TF1[order(diffResMG63_TF1$Score,decreasing=TRUE),][1:n,]
+unique(diffResHOS_TF$TF)
+unique(diffResMG63_TF1$TF)
+# Combine top differential edges in HOS and MG63 to plot in Cytoscape
+diffRes_vis_TF1 <- rbind(diffResHOS_TF, diffResMG63_TF1)
+unique(diffRes_vis_TF1$TF)
+# Plot the network
+visDiffPandaInCytoscape(diffRes_vis_TF1, condition_name = "High_Agressive", network_name="HOS_MG63_C1diff_100_TF.PANDA")
+
+
+# Select the top differential edges higher in HOS to plot in Cytoscape
+n=100 # number of edges to select from each condition
+diffResU2OS_TF <- diffRes_U2OS_MG63_TF[diffRes_U2OS_MG63_TF$High_Agressive=="T",]
+diffResU2OS_TF <- diffResU2OS_TF[order(diffResU2OS_TF$Score,decreasing=TRUE),][1:n,]
+# Select the top differential edges higher in MG63 to plot in Cytoscape
+diffResMG63_TF2 <- diffRes_U2OS_MG63_TF[diffRes_U2OS_MG63_TF$High_Agressive=="F",]
+diffResMG63_TF2 <- diffResMG63_TF2[order(diffResMG63_TF2$Score,decreasing=TRUE),][1:n,]
+unique(diffResU2OS_TF$TF)
+unique(diffResMG63_TF2$TF)
+# Combine top differential edges in HOS and MG63 to plot in Cytoscape
+diffRes_vis_TF2 <- rbind(diffResU2OS_TF, diffResMG63_TF2)
+unique(diffRes_vis_TF2$TF)
+# Plot the network
+visDiffPandaInCytoscape(diffRes_vis_TF2, condition_name = "High_Agressive", network_name="U2OS_MG63_C1diff_100_Filtering.PANDA")
+
+```
+
+
+
+#### 4.3. Plot the highest differential networks betweeen High Agressive (HOS/U2OS) versus Low Agressive (MG63)
+```{r}
+## Plot differential networks betweeen HOS (High Agressive) versus MG63 (Low Agressive)
+# Select the top differential edge weights betweeen HOS and MG63
+diffRes_HOS_MG63 <- pandaDiffEdges(HOS_vis, MG63_vis, threshold=0.8, condition_name="High_Agressive")
+## Plot differential networks betweeen U2OS (High Agressive) versus MG63 (Low Agressive)
+diffRes_U2OS_MG63 <- pandaDiffEdges(U2OS_vis, MG63_vis, threshold=0.8, condition_name="High_Agressive")
+
+# Number of differential edges is:
+nrow(diffRes_HOS_MG63) # 125104
+nrow(diffRes_U2OS_MG63) # 127677
+
+#  Apply the style to the network. Purple edges indicate higher edge weight in the defined "condition_name" parameter (HOS in our example), and green edges indicate higher edge weight in the other condition (MG63 in our example).
+# createDiffPandaStyle(style_name="Diff.PandaStyle", condition_name="High_Agressive")
+
+# Select the top differential edges higher in HOS to plot in Cytoscape
+n=50 # number of edges to select from each condition
+diffResHOS <- diffRes_HOS_MG63[diffRes_HOS_MG63$High_Agressive=="T",]
+diffResHOS <- diffResHOS[order(diffResHOS$Score,decreasing=TRUE),][1:n,]
+# Select the top differential edges higher in MG63 to plot in Cytoscape
+diffResMG63_1 <- diffRes_HOS_MG63[diffRes_HOS_MG63$High_Agressive=="F",]
+diffResMG63_1 <- diffResMG63_1[order(diffResMG63_1$Score,decreasing=TRUE),][1:n,]
+# Combine top differential edges in HOS and MG63 to plot in Cytoscape
+diffRes_vis_1 <- rbind(diffResHOS, diffResMG63_1)
+# Plot the network
+visDiffPandaInCytoscape(diffRes_vis_1, condition_name = "High_Agressive", network_name="HOS_MG63_C1C4diff_50_Filtering.PANDA")
+
+
+# Select the top differential edges higher in HOS to plot in Cytoscape
+n=50 # number of edges to select from each condition
+diffResU2OS <- diffRes_U2OS_MG63[diffRes_U2OS_MG63$High_Agressive=="T",]
+diffResU2OS <- diffResU2OS[order(diffResU2OS$Score,decreasing=TRUE),][1:n,]
+# Select the top differential edges higher in MG63 to plot in Cytoscape
+diffResMG63_2 <- diffRes_U2OS_MG63[diffRes_U2OS_MG63$High_Agressive=="F",]
+diffResMG63_2 <- diffResMG63_2[order(diffResMG63_2$Score,decreasing=TRUE),][1:n,]
+# Combine top differential edges in HOS and MG63 to plot in Cytoscape
+diffRes_vis_2 <- rbind(diffResU2OS, diffResMG63_2)
+# Plot the network
+visDiffPandaInCytoscape(diffRes_vis_2, condition_name = "High_Agressive", network_name="U2OS_MG63_C1C4diff_50_Filtering.PANDA")
+
+```
+
+### 5. Calculating degree
+```{r}
+# Finally, we can compute gene targeting scores4 as a summary statistic for all genes and TFs defined as follows:
+# out-degrees of TFs: sum of the weights of outbound edges around a TF
+HOS_outdegree <- calcDegree(net_HOS, type="tf")
+low_aggMG63rent_outdegree  <- calcDegree(net_MG63, type="tf")
+# in-degrees of genes: sum of the weights of inbound edges around a gene
+HOS_indegree  <- calcDegree(net_HOS, type="gene")
+low_aggMG63rent_indegree   <- calcDegree(net_MG63, type="gene")
+
+# Calculate the gene in-degree difference for two different panda regulatory networks (HOS minus MG63)
+degreeDiff_HOS_MG63 <- calcDegreeDifference(net_HOS, net_MG63, type="gene")
+head(degreeDiff_HOS_MG63)
+# Calculate the gene in-degree difference for two different panda regulatory networks (U2OS minus MG63)
+degreeDiff_U2OS_MG63 <- calcDegreeDifference(net_U2OS, net_MG63, type="gene")
+head(degreeDiff_U2OS_MG63)
+
+# To retrieve biological-relevant processes, we will load and use the complete ranked gene list (5891 genes) calculated from the complete network.
+degreeDiff_HOS_MG63 <- as.data.frame(degreeDiff_HOS_MG63, row.names = NULL)
+degreeDiff_HOS_MG63 <- rownames_to_column(degreeDiff_HOS_MG63, "rownames")
+degreeDiff_HOS_MG63 <- setNames(degreeDiff_HOS_MG63[,2], degreeDiff_HOS_MG63[,1])
+# head(table(degreeDiff_HOS_MG63))
+
+degreeDiff_U2OS_MG63 <- as.data.frame(degreeDiff_U2OS_MG63, row.names = NULL)
+degreeDiff_U2OS_MG63 <- rownames_to_column(degreeDiff_U2OS_MG63, "rownames")
+degreeDiff_U2OS_MG63 <- setNames(degreeDiff_U2OS_MG63[,2], degreeDiff_U2OS_MG63[,1])
+#head(degreeDiff_U2OS_MG63)[1:6, 1:6]
+
+```
+
+#### 6 Gene Set Enrichment Analysis
+Data will use the fgsea package to perform gene set enrichment analysis. We need to point to a ranked gene list (for example the gene in-degree difference between HOS and MG63), and a list of gene sets (or signatures) in gmt format to test for enrichment. The gene sets can be downloaded from MSigDB: http://software.broadinstitute.org/gsea/msigdb Same gene annotation should be used in the ranked gene list and gene sets. In our example we will use the KEGG pathways downloaded from MSigDB.
+```{r}
+# https://bioconductor.org/packages/release/bioc/vignettes/fgsea/inst/doc/geseca-tutorial.html
+# Run fgsea
+library("msigdbr")
+library("fgsea")
+# msigdbr_collections()
+pathwaysDF <- msigdbr(species = "Homo sapiens", category = "H")
+# pathwaysDF <- msigdbr("human", category="C2")
+# Extract the gene list following pathway
+pathways <- split(as.character(pathwaysDF$gene_symbol), pathwaysDF$gs_name)
+# Run the GSEA analysis
+fgsea_Diff_HOS_MG63 <- fgsea(pathways, degreeDiff_HOS_MG63, minSize=15, maxSize=500)
+fgsea_Diff_U2OS_MG63 <- fgsea(pathways, degreeDiff_U2OS_MG63, minSize=15, maxSize=500)
+head(fgsea_Diff_HOS_MG63[order(pval), ])
+head(fgsea_Diff_U2OS_MG63[order(pval), ])
+
+# Determine what pathways signatures to plot (based on FDR cut) to use as output for significant signatures
+Diff_HOS_MG63 <- data.frame(fgsea_Diff_HOS_MG63[fgsea_Diff_HOS_MG63$padj < 0.05,]) 
+Diff_U2OS_MG63 <- data.frame(fgsea_Diff_U2OS_MG63[fgsea_Diff_U2OS_MG63$padj < 0.05,]) 
+# Get the top 6 significant pathways enriched for genes having lower targeting in HOSs  
+head(Diff_U2OS_MG63[order(Diff_U2OS_MG63$NES),])
+head(Diff_HOS_MG63[order(Diff_HOS_MG63$NES),])
+
+
+## Visualize this result as a bubble plot that we construct as follows. First, we set some general settings for the plot
+Diff_HOS_MG63 <- Diff_HOS_MG63[order(Diff_HOS_MG63[,"padj"]),] 
+Diff_HOS_MG63$signature <- factor(Diff_HOS_MG63$pathway, rev(as.character(Diff_HOS_MG63$pathway)))
+# Determine what labels to color 
+signcol <- rep(NA, length(Diff_HOS_MG63$signature))
+signcol[which(Diff_HOS_MG63[,"NES"]<0)] <- "#60bf71" # text color of negative signatures
+signcol[which(Diff_HOS_MG63[,"NES"]>0)] <- "#92278f" # text color of positive signatures
+signcol <- rev(signcol) # need to revert vector of colors, because ggplot starts plotting these from below
+# Plot bubble plot
+ggplot(Diff_HOS_MG63, aes(x=padj,y=signature,size=size))+ 
+  geom_point(aes(fill=NES), shape=21, colour="#60bf71")+
+  theme_bw()+ # white background, needs to be placed before the "signcol" line
+  xlim(-0.025, 0.05)+  # range for FDR cut-off to use as output for significant signatures
+  scale_size_area(max_size=10, name="size")+
+  scale_fill_gradient2(low="#60bf71", high= "#92278f")+
+  theme(axis.text.y = element_text(colour=signcol))+
+  theme(aspect.ratio=3, axis.title.y=element_blank()) # t# aspect ratio of bubble plot
+
+## Visualize this result as a bubble plot that we construct as follows. First, we set some general settings for the plot
+Diff_U2OS_MG63 <- Diff_U2OS_MG63[order(Diff_U2OS_MG63[,"padj"]),] 
+Diff_U2OS_MG63$signature <- factor(Diff_U2OS_MG63$pathway, rev(as.character(Diff_U2OS_MG63$pathway)))
+# Determine what labels to color
+signcol <- rep(NA, length(Diff_U2OS_MG63$signature))
+signcol[which(Diff_U2OS_MG63[,"NES"]<0)] <- "#60bf71" # text color of negative signatures
+signcol[which(Diff_U2OS_MG63[,"NES"]>0)] <- "#92278f" # text color of positive signatures
+signcol <- rev(signcol) # need to revert vector of colors, because ggplot starts plotting these from below
+# Plot bubble plot
+ggplot(Diff_U2OS_MG63, aes(x=padj,y=signature,size=size))+ 
+  geom_point(aes(fill=NES), shape=21, colour="#60bf71")+
+  theme_bw()+ # white background, needs to be placed before the "signcol" line
+  xlim(-0.025, 0.05)+  # range for FDR cut-off to use as output for significant signatures
+  scale_size_area(max_size=10, name="size")+
+  scale_fill_gradient2(low="#60bf71", high= "#92278f")+
+  theme(axis.text.y = element_text(colour=signcol))+
+  theme(aspect.ratio=3, axis.title.y=element_blank()) # t# aspect ratio of bubble plot
+
+# Plot an enrichment plot for a pathway
+plotEnrichment(pathways[["HALLMARK_MYOGENESIS"]], degreeDiff_HOS_MG63) + labs(title="Myogenesis pathway")
+plotEnrichment(pathways[["HALLMARK_MYC_TARGETS_V1"]], degreeDiff_HOS_MG63) + labs(title="MYC target pathway")
+
+```
+#### 6 Gene Set Enrichment Analysis
+Data will use the fgsea package to perform gene set enrichment analysis. We need to point to a ranked gene list (for example the gene in-degree difference between HOS and MG63), and a list of gene sets (or signatures) in gmt format to test for enrichment. The gene sets can be downloaded from MSigDB: http://software.broadinstitute.org/gsea/msigdb Same gene annotation should be used in the ranked gene list and gene sets. In our example we will use the KEGG pathways downloaded from MSigDB.
+```{r}
+# https://bioconductor.org/packages/release/bioc/vignettes/fgsea/inst/doc/geseca-tutorial.html
+# Run fgsea
+library("msigdbr")
+library("fgsea")
+# msigdbr_collections()
+# pathwaysDF <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG_LEGACY")
+# pathwaysDF <- msigdbr(species = "Homo sapiens", category = "C3", subcategory = "TFT")
+pathwaysDF <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP")
+# pathwaysDF <- msigdbr("human", category="C2") CP:KEGG_LEGACY TFT GO:BP
+# Extract the gene list following pathway
+pathways <- split(as.character(pathwaysDF$gene_symbol), pathwaysDF$gs_name)
+# Run the GSEA analysis
+fgsea_Diff_HOS_MG63 <- fgsea(pathways, degreeDiff_HOS_MG63, minSize=15, maxSize=500)
+fgsea_Diff_U2OS_MG63 <- fgsea(pathways, degreeDiff_U2OS_MG63, minSize=15, maxSize=500)
+head(fgsea_Diff_HOS_MG63[order(pval), ])
+head(fgsea_Diff_U2OS_MG63[order(pval), ])
+
+# Determine what pathways signatures to plot (based on FDR cut) to use as output for significant signatures
+Diff_HOS_MG63 <- data.frame(fgsea_Diff_HOS_MG63[fgsea_Diff_HOS_MG63$padj < 0.05,]) 
+Diff_U2OS_MG63 <- data.frame(fgsea_Diff_U2OS_MG63[fgsea_Diff_U2OS_MG63$padj < 0.05,]) 
+
+## Visualize this result as a bubble plot that we construct as follows. First, we set some general settings for the plot
+library(dplyr)
+library(ggplot2)
+
+# keep top 5 per sign (by lowest padj)
+top5_by_sign <- function(df) {
+  pos <- df %>% filter(NES > 0) %>% arrange(padj, desc(NES)) %>% slice_head(n = 5)
+  neg <- df %>% filter(NES < 0) %>% arrange(padj, NES)       %>% slice_head(n = 5)
+  out <- bind_rows(pos, neg) %>% arrange(padj)
+  # y-axis order (reversed so most significant appears near top)
+  out$signature <- factor(out$pathway, levels = rev(out$pathway))
+  out
+}
+
+# bubble plot (keeps your styling)
+plot_bubble <- function(df, title = NULL) {
+  # color y labels by sign of NES
+  signcol <- ifelse(df$NES < 0, "#60bf71", "#92278f")
+  signcol <- rev(signcol)  # ggplot draws from bottom up
+  # Plot by ggplot2
+  ggplot(df, aes(x = padj, y = signature, size = size)) +
+    geom_point(aes(fill = NES), shape = 21, colour = "grey20", stroke = 0.2) +
+    theme_bw() +
+    xlim(-0.025, 0.05) +
+    scale_size_area(max_size = 10, name = "size") +
+    scale_fill_gradient2(low = "#60bf71", high = "#92278f") +
+    theme(axis.text.y = element_text(colour = signcol),
+          aspect.ratio = 3,
+          axis.title.y = element_blank()) +
+    labs(title = title, x = "FDR (padj)", fill = "NES")
+}
+
+## HOS vs MG63
+Diff_HOS_MG63_top <- top5_by_sign(Diff_HOS_MG63)
+plot_bubble(Diff_HOS_MG63_top, "HOS vs MG63 (top 5 up & down)")
+ggsave(file=file.path(plots_dir, "GSEA_GOBP_HOS_versus_MG63_cell_type_edges.pdf"), height = 5, width = 8)
+## U2OS vs MG63
+Diff_U2OS_MG63_top <- top5_by_sign(Diff_U2OS_MG63)
+plot_bubble(Diff_U2OS_MG63_top, "U2OS vs MG63 (top 5 up & down)")
+ggsave(file=file.path(plots_dir, "GSEA_GOBP_U2OS_versus_MG63_cell_type_edges.pdf"), height = 5, width = 8)
+
+```
+```{r}
+# Suppose your fgsea results are in Diff_HOS_MG63
+# and you want NES + padj for "GOBP_CELL_MORPHOGENESIS"
+res <- Diff_HOS_MG63 %>% filter(pathway == "GOBP_CELL_MORPHOGENESIS")
+# Make enrichment plot
+plotEnrichment(pathways[["GOBP_CELL_MORPHOGENESIS"]], degreeDiff_HOS_MG63) +
+  labs(title = "GOBP_CELL_MORPHOGENESIS (catTFRE_HOS/MG63)",
+       subtitle = paste0("NES = ", round(res$NES, 2), ", padj = ", signif(res$padj, 3))) 
+ggsave(file=file.path(plots_dir, "GOBP_CELL_MORPHOGENESIS_HOS_versus_MG63.pdf"), height = 5, width = 8)
+
+
+res <- Diff_U2OS_MG63 %>% filter(pathway == "GOBP_CELL_MORPHOGENESIS")
+# Make enrichment plot
+plotEnrichment(pathways[["GOBP_CELL_MORPHOGENESIS"]], degreeDiff_U2OS_MG63) +
+  labs(title = "GOBP_CELL_MORPHOGENESIS (catTFRE_U2OS/MG63)",
+       subtitle = paste0("NES = ", round(res$NES, 2), ", padj = ", signif(res$padj, 3))) 
+ggsave(file=file.path(plots_dir, "GOBP_CELL_MORPHOGENESIS_U2OS_versus_MG63.pdf"), height = 5, width = 8)
+```
+
+
+```{r}
+pdf(file.path(plots_dir, "HOS_U2OS_legend_only.pdf"), width = 3, height = 2)
+par(mar = c(0,0,0,0)); plot.new()
+legend("center",
+       legend = c("HOS", "MG63"),
+       col    = c("#92278f",       "#60bf71"),
+       lty = 1, lwd = 3, bty = "o", cex = 0.9)
+dev.off()
+
+pdf(file.path(plots_dir, "U2OS_MG63_legend_only.pdf"), width = 3, height = 2)
+par(mar = c(0,0,0,0)); plot.new()
+legend("center",
+       legend = c("U2OS", "MG63"),
+       col    = c( "#92278f",        "#60bf71"),
+       lty = 1, lwd = 3, bty = "o", cex = 0.9)
+dev.off()
+```
+
+
+
+
+##References
+http://netbooks.networkmedicine.org/user/thangnx1012/notebooks/netZooR/panda_gtex_tutorial_server.ipynb
+
