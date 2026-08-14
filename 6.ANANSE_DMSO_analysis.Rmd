@@ -1,0 +1,226 @@
+---
+title: "ANANSE_analysis"
+author: "XuanThangNguyen"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+
+```{r, include=FALSE}
+options(width=1234)
+library("ggplot2")
+library("ggrepel")
+library("dplyr")
+library("openxlsx")
+library("circlize")
+library("igraph")
+library("ggraph")
+library("tidygraph")
+library("rprojroot")
+# Define paths
+root_dir <- rprojroot::find_root(rprojroot::has_dir("ANANSE_DMSO"))
+analysis_dir <- file.path(root_dir, "ANANSE_DMSO")
+plots_dir <- file.path(analysis_dir, "Plots")
+
+# Create directories if they don't exist
+if (!dir.exists(plots_dir)) {dir.create(plots_dir, recursive = TRUE)}
+if (!dir.exists(analysis_dir)) {dir.create(analysis_dir, recursive = TRUE)}
+
+```
+
+
+
+
+```{r, echo=FALSE}
+# Load the previos data
+catTFRE_designed <- read.xlsx(file.path(analysis_dir,"catTFRE_designed_TFs_126_TFs.xlsx"))
+DEP_HOSMG63_C1 <- read.xlsx(file.path(analysis_dir, "Diffenrential_Enrichment_Protein_HOS_vs_MG63.xlsx"))
+DEP_HOSMG63_C1_DEP <- DEP_HOSMG63_C1 %>% filter(Expression %in% c("TF_Upregulated", "TF_Downregulated")) %>% pull(name)
+catTFRE_MS_C1C4 <- read.xlsx(file.path(analysis_dir, "TFs_detected_per_condition_merged.xlsx"))
+catTFRE_MS_C1C4_detect <- c(catTFRE_MS_C1C4$C1_any_of_3cells, catTFRE_MS_C1C4$C4_any_of_3cells) %>% unique()
+#DEP_HOSMG63_C1_DEP <- DEP_HOSMG63_C1 %>% filter(!Expression == "Not_significant") %>% pull(name)
+ANANSE_HOS_MG63_influence <- read.delim(file.path(analysis_dir, "ANANSE_HOS_MG63_influence", "ANANSE_HOS_MG63_influence.tsv"))
+
+# Add catTFRE into ANANSE data
+ANANSE_HOS_MG63_influence <- ANANSE_HOS_MG63_influence %>% 
+  mutate(TF_design = ifelse(factor %in% catTFRE_designed$TF_design, "Yes", "No"),
+         DEP_HOSMG63_C1 = ifelse(factor %in% DEP_HOSMG63_C1_DEP, "Yes", "No"),
+         catTFRE_MS_C1C4 = ifelse(factor %in% catTFRE_MS_C1C4_detect , "Yes", "No"),
+         group = case_when(TF_design == "Yes" & DEP_HOSMG63_C1 == "Yes" ~ "DEP_C1+TF_design",
+                           TF_design == "Yes" & DEP_HOSMG63_C1 == "No" & catTFRE_MS_C1C4 == "Yes"  ~ "catTFRE_C1C4+TF_design",
+                           TF_design == "Yes" & DEP_HOSMG63_C1 == "No"  ~ "TF_design_only",
+                           TF_design == "No"  & DEP_HOSMG63_C1 == "Yes" ~ "DEP_C1_only",
+                           TF_design == "No"  & DEP_HOSMG63_C1 == "No" & catTFRE_MS_C1C4 == "Yes" ~ "catTFRE_C1C4_only",
+                           TRUE ~ "None"))
+table(ANANSE_HOS_MG63_influence$group)
+write.xlsx(ANANSE_HOS_MG63_influence, file = file.path(plots_dir, "ANANSE_HOS_MG63_influence.xlsx"))
+# Look at the TF list
+ANANSE_HOS_MG63_influence %>% filter(group == "DEP_C1+TF_design") %>% pull (factor)
+ANANSE_HOS_MG63_influence %>% filter(group == "DEP_C1_only") %>% pull (factor)
+ANANSE_HOS_MG63_influence %>% filter(group == "TF_design_only") %>% pull (factor)
+ANANSE_HOS_MG63_influence %>% filter(group == "None") %>% pull (factor)
+# Select the TF in the influence table
+selected_tfs <- c("FLI1", "PAX6", "MYBL2", # DEP_C1+TF_design 
+                  "NR2F2", "RUNX2", "SIX4", "FOXO1", "TP53", "FOXL2", "NKX2-4", # DEP only 
+                  "CDX2", # TF-design
+                  "GATA2", "TEAD4")# none
+#selected_tfs <- ANANSE_HOS_MG63_influence$factor
+# Plot
+ggplot(ANANSE_HOS_MG63_influence, aes(x=factor_fc, y=influence_score, size = direct_targets, color=group)) +
+  geom_point(alpha = 0.8) +
+  scale_size(range = c(1,8)) + 
+  theme_bw(base_size = 12) +
+  geom_text_repel(data = subset(ANANSE_HOS_MG63_influence, factor %in% selected_tfs),
+                  aes(label = factor), 
+                  size = 4, box.padding = 0.5, point.padding = 0.0, 
+                  segment.color = "grey80", segment.size = 0.5, 
+                  min.segment.length = 0,max.overlaps = Inf) +
+  scale_color_manual(values = c("DEP_C1+TF_design" = "red", "TF_design_only" = "#9ecae1", "catTFRE_C1C4+TF_design" = "dodgerblue",
+                                "DEP_C1_only" = "#41ab5d", "catTFRE_C1C4_only" = "#8332FF", "None" = "grey80")) +  
+  labs(title = "HOS_MG63_TF_predict_influence",
+       x = "TF (log2FoldChange)",
+       y = "Influence score",
+       size = "Number of\ndirect targets")
+ggsave(file.path(plots_dir, "HOS_MG63_integration_ANANSE_catTFRE.pdf"), height = 4, width = 6.5)
+# ggsave(file.path(plots_dir, "HOS_MG63_integration_ANANSE_catTFRE_ALLgenes.pdf"), height = 4, width = 6)
+
+
+```
+
+```{r}
+# Load the previos data
+catTFRE_designed <- read.xlsx(file.path(analysis_dir,"catTFRE_designed_TFs_126_TFs.xlsx"))
+DEP_U2OSMG63_C1 <- read.xlsx(file.path(analysis_dir, "Diffenrential_Enrichment_Protein_U2OS_vs_MG63.xlsx"))
+DEP_U2OSMG63_C1_DEP <- DEP_U2OSMG63_C1 %>% filter(Expression == "TF_Upregulated") %>% pull(name)
+
+
+ANANSE_U2OS_MG63_influence <- read.delim(file.path(analysis_dir, "ANANSE_U2OS_MG63_influence", "ANANSE_U2OS_MG63_influence.tsv"))
+# Add catTFRE into ANANSE data
+ANANSE_U2OS_MG63_influence <- ANANSE_U2OS_MG63_influence %>% 
+  mutate(TF_design = ifelse(factor %in% catTFRE_designed$TF_design, "Yes", "No"),
+         DEP_U2OSMG63_C1 = ifelse(factor %in% DEP_U2OSMG63_C1_DEP, "Yes", "No"),
+         catTFRE_MS_C1C4 = ifelse(factor %in% catTFRE_MS_C1C4_detect , "Yes", "No"),
+         group = case_when(TF_design == "Yes" & DEP_U2OSMG63_C1 == "Yes" ~ "DEP_C1+TF_design",
+                           TF_design == "Yes" & DEP_U2OSMG63_C1 == "No" & catTFRE_MS_C1C4 == "Yes"  ~ "catTFRE_C1C4+TF_design",
+                           TF_design == "Yes" & DEP_U2OSMG63_C1 == "No"  ~ "TF_design_only",
+                           TF_design == "No"  & DEP_U2OSMG63_C1 == "Yes" ~ "DEP_C1_only",
+                           TF_design == "No"  & DEP_U2OSMG63_C1 == "No" & catTFRE_MS_C1C4 == "Yes" ~ "catTFRE_C1C4_only",
+                           TRUE ~ "None"))
+table(ANANSE_U2OS_MG63_influence$group)
+write.xlsx(ANANSE_U2OS_MG63_influence, file = file.path(plots_dir, "ANANSE_U2OS_MG63_influence.xlsx"))
+# Look at the TF list
+ANANSE_U2OS_MG63_influence %>% filter(group == "DEP_C1+TF_design") %>% pull (factor)
+ANANSE_U2OS_MG63_influence %>% filter(group == "DEP_C1_only") %>% pull (factor)
+ANANSE_U2OS_MG63_influence %>% filter(group == "TF_design_only") %>% pull (factor)
+ANANSE_U2OS_MG63_influence %>% filter(group == "None") %>% pull (factor)
+# Select the TF in the influence table
+selected_tfs <- c("ETV6", "MYBL2", # DEP_C1+TF_design 
+                  "TP53","RUNX1","CEBPB","RUNX2","ZNF281", # DEP only 
+                  "GATA3", "GLI2", # TF-design
+                  "GATA2", "TEAD4")# none
+# selected_tfs <- ANANSE_U2OS_MG63_influence$factor
+# Plot
+ggplot(ANANSE_U2OS_MG63_influence, aes(x=factor_fc, y=influence_score, size = direct_targets, color=group)) +
+  geom_point(alpha = 0.8) +
+  scale_size(range = c(1,8)) + 
+  theme_bw(base_size = 12) +
+  geom_text_repel(data = subset(ANANSE_U2OS_MG63_influence, factor %in% selected_tfs),
+                  aes(label = factor), 
+                  size = 4, box.padding = 0.5, point.padding = 0.0, 
+                  segment.color = "grey80", segment.size = 0.5, 
+                  min.segment.length = 0,max.overlaps = Inf) +
+  scale_color_manual(values = c("DEP_C1+TF_design" = "red", "TF_design_only" = "#9ecae1", "catTFRE_C1C4+TF_design" = "dodgerblue",
+                                "DEP_C1_only" = "#41ab5d", "catTFRE_C1C4_only" = "#8332FF", "None" = "grey80")) +  
+  labs(title = "U2OS_MG63_TF_predict_influence",
+       x = "TF (log2FoldChange)",
+       y = "Influence score",
+       size = "Number of\ndirect targets")
+ggsave(file.path(plots_dir, "U2OS_MG63_integration_ANANSE_catTFRE.pdf"), height = 4, width = 6.5)
+# ggsave(file.path(plots_dir, "U2OS_MG63_integration_ANANSE_catTFRE_All_genes.pdf"), height = 4, width = 6.5)
+```
+
+```{r}
+ANANSE_U2OS_MG63_network <- read.delim(file.path(analysis_dir, "ANANSE_U2OS_MG63_influence", "ANANSE_U2OS_MG63_influence_diffnetwork.tsv"))
+# First pass: build full TF-TF network to calculate outdegree
+net_tf <- ANANSE_U2OS_MG63_network %>%
+  filter(source %in% ANANSE_U2OS_MG63_influence$factor, target %in% ANANSE_U2OS_MG63_influence$factor)
+
+g_full <- graph_from_data_frame(net_tf, directed = TRUE)
+outdeg <- igraph::degree(g_full, mode = "out")
+
+# Get top 30 by outdegree
+top30 <- names(sort(outdeg, decreasing = TRUE))[1:25]
+
+# Second pass: filter to only edges between top 30
+net_filtered <- net_tf %>%
+  filter(source %in% top30, target %in% top30)
+
+# Rebuild graph
+g <- graph_from_data_frame(net_filtered, directed = TRUE)
+V(g)$outdegree <- igraph::degree(g, mode = "out")
+
+tg <- as_tbl_graph(g)
+
+set.seed(1234)
+ggraph(tg, layout = "fr") +
+  geom_edge_link(aes(width = weight),
+                 arrow = arrow(length = unit(1, "mm"), type = "closed"),
+                 end_cap = circle(5, "mm"),
+                 start_cap = circle(5, "mm"),
+                 alpha = 0.2,
+                 color = "grey30") +
+  scale_edge_width_continuous(range = c(0.25, 1), name = "weight") +
+  geom_node_point(aes(color = outdegree, size = outdegree)) +
+  scale_color_viridis_c(option = "D", name = "outdegree\n(regulation other TFs)") +
+  #scale_color_gradient(low = "lightgreen", high = "darkgreen", name = "outdegree\n(regulation other TFs)")
+  #scale_color_gradientn(colors = c("#90EE90", "#228B22", "#003300"), name = "outdegree\n(regulation other TFs)") +
+  scale_size_continuous(range = c(6, 16), guide = "none") +
+  geom_node_text(aes(label = name), size = 3, color = "black") +
+  theme_graph(base_family = "") +
+  theme(legend.position = "right")
+ggsave(file.path(plots_dir, "ANANSE_U2OS_MG63_topTF_GRN_to30.pdf"), width = 8, height = 6)
+```
+
+
+
+```{r}
+ANANSE_HOS_MG63_network <- read.delim(file.path(analysis_dir, "ANANSE_HOS_MG63_influence", "ANANSE_HOS_MG63_influence_diffnetwork.tsv"))
+# First pass: build full TF-TF network to calculate outdegree
+net_tf <- ANANSE_HOS_MG63_network %>%
+  filter(source %in% ANANSE_HOS_MG63_influence$factor, target %in% ANANSE_HOS_MG63_influence$factor)
+
+g_full <- graph_from_data_frame(net_tf, directed = TRUE)
+outdeg <- igraph::degree(g_full, mode = "out")
+
+# Get top 30 by outdegree
+top30 <- names(sort(outdeg, decreasing = TRUE))[1:25]
+
+# Second pass: filter to only edges between top 30
+net_filtered <- net_tf %>%
+  filter(source %in% top30, target %in% top30)
+
+# Rebuild graph
+g <- graph_from_data_frame(net_filtered, directed = TRUE)
+V(g)$outdegree <- igraph::degree(g, mode = "out")
+
+tg <- as_tbl_graph(g)
+
+set.seed(1234)
+ggraph(tg, layout = "fr") +
+  geom_edge_link(aes(width = weight),
+                 arrow = arrow(length = unit(1, "mm"), type = "closed"),
+                 end_cap = circle(5, "mm"),
+                 start_cap = circle(5, "mm"),
+                 alpha = 0.2,
+                 color = "grey30") +
+  scale_edge_width_continuous(range = c(0.25, 1), name = "weight") +
+  geom_node_point(aes(color = outdegree, size = outdegree)) +
+  scale_color_viridis_c(option = "D", name = "outdegree\n(regulation other TFs)") +
+  scale_size_continuous(range = c(6, 16), guide = "none") +
+  geom_node_text(aes(label = name), size = 3, color = "black") +
+  theme_graph(base_family = "") +
+  theme(legend.position = "right")
+ggsave(file.path(plots_dir, "ANANSE_HOS_MG63_topTF_GRN_top30.pdf"), width = 8, height = 6)
+```
+
+
