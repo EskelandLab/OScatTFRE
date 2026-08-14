@@ -1,0 +1,599 @@
+---
+title: "RNAseq_Osteosarcoma"
+author: "Xuan-Thang Nguyen"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+# Summary 
+This script implements a simple overview of Mass Spectrometry (MS) data analysis with **DESeq2 package**. 
+The data including 3 cell lines (HOS, U2OS and MG63), with 4 biological/technical replicates, that make total 12 single run
+
+The main steps of analysis:  
+- Exploring data before the differential expression analysis  
+- Importing **RNAseq HTS counts** into **DESeq2 package** list    
+- Performing the analysis with **DESeq2**  
+- Exporting and exploring the results  
+The results are exported into a text file and visualized using ggplot heatmaps and volcano-plots. 
+
+Detailed tutorial for **DESeq2 package** package could be accessed here:  
+http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html
+*[r4rnaseq-workshop.Rmd] (https://github.com/nih-cfde/training-rstudio-binder/blob/data/GTEx/r4rnaseq-workshop.Rmd) was last modified 14 March, 2022.*
+
+
+1. R package and data preparation
+
+After installing packages, we need to load the functions and tools we want to use from the package with the `library()` command. Let's load the following packages: `ggplot2, tidyr, dplyr, readr, and tibble` by copying and pasting or typing these commands into your new script.
+
+```{r setup, include=FALSE,  warning=F}
+library("RColorBrewer")
+# library("pals")
+library("pheatmap")
+library("ggrepel")
+library("ggplot2")
+library("tidyr")
+library("dplyr")
+library("tibble")
+library("cowplot")
+library("scales")
+library("forcats")
+library("stringr")
+library("DESeq2")
+library("openxlsx")
+library("clusterProfiler")
+library("ComplexHeatmap")
+library("circlize")
+
+options(width=999)
+
+# Set directory paths
+library(rprojroot)
+# Define paths
+root_dir <- rprojroot::find_root(rprojroot::has_dir("OS_RNAseq_Emily"))
+analysis_dir <- file.path(root_dir, "OS_RNAseq_Emily")
+plots_dir <- file.path(root_dir, "OS_RNAseq_Emily", "Results_FINAL_RAW")
+
+# Create directories if they don't exist
+if (!dir.exists(plots_dir)) {
+  dir.create(plots_dir, recursive = TRUE)
+}
+if (!dir.exists(analysis_dir)) {
+  dir.create(analysis_dir, recursive = TRUE)
+}
+
+```
+
+2. Overview of RNAseq data
+Data can be imported using packages from base R or the tidyverse. To begin with, `read.csv()` replaces spaces and dashes periods in column names, and it also preserves row.names. On the other hand, we will use DESeqDataSetFromHTSeqCount function from DESeq2 to import data from HTSeq count, which means we may do not need to be imported single file with `read.table()` or  `read_tsv()`.
+2.1. Design experiment and input data
+
+```{r import-1, appendix = TRUE}
+# Import HTSeq file folder
+directory <- file.path(analysis_dir, 'RNAseq_RAW') 
+# Collect sample from HTseq file
+sample_files <- grep("_pergene_counts.txt", list.files(directory), value=TRUE)
+sample_files
+
+# Generate experimental design
+experiment_design <- data.frame(sample = gsub("_pergene_counts.txt", "\\1", sample_files))
+experiment_design$sample_files <- sample_files
+experiment_design$cell <- gsub("_[0-9]_pergene_counts.txt", "\\1", sample_files)
+experiment_design$replicate <- sapply(strsplit(experiment_design$sample, split = "_"), "[", 2)
+experiment_design$conditions <- ifelse(experiment_design$cell == "MG63",  "Low_Aggressive", "High_Aggressive")
+# Prints the sample / condition list
+head(experiment_design)
+# is.factor(experiment_design$cell)
+# relevel the factor as comparision status: R will choose a reference level for factors based on alphabetical order. you can either explicitly tell results which comparison to make using the contrast argument after DESeq2 analysis
+# experiment_design$cell <- factor(experiment_design$cell, levels = c("HOS","MG63", "U2OS"))
+experiment_design$cell <- relevel(factor(experiment_design$cell), ref = "MG63")
+is.factor(experiment_design$cell)
+experiment_design$conditions <- relevel(factor(experiment_design$conditions), ref = "Low_Aggressive")
+is.factor(experiment_design$conditions) 
+
+# Import Transcription factor list
+TFs_list <- read.xlsx(file.path(analysis_dir, "TFs_list_Cell2018.xlsx"))
+dim(TFs_list)
+# Human Epifactor gene list: https://epifactors.autosome.org/description
+Epifactor_list <- read.xlsx(file.path(analysis_dir, "Epifactor_Histone_list.xlsx"))
+dim(Epifactor_list)
+
+
+# 2.2. SummarizedExperiment input and filtering samples
+
+## Build a DESeq2DataSet with condition with HTseq
+ddsHTSeq <- DESeqDataSetFromHTSeqCount(sampleTable = experiment_design,
+                                       directory = directory,
+                                       design= ~ cell ) # + conditions cell
+# Look at DEseq2 dataset
+# ddsHTSeq
+dim(ddsHTSeq)
+
+
+# Pre-filtering by removing the lower expression data
+# keep <- rowSums(counts(ddsHTSeq)) >= 10 # remove gene with low/not expression level detection
+keep <- rowSums(counts(ddsHTSeq) >= 10) >= 4 # at least 4 samples (smallestGroupSize) with a count of 10 or higher
+table(keep)
+# Filtering
+ddsHTSeq <- ddsHTSeq[keep,] 
+rm(keep)
+
+# Check what different of experiment between fitering and raw as half of gene names with low expression were removed (46k versus 23k genes)
+# ddsHTSeq
+dim(ddsHTSeq)
+
+## Differential expression analysis
+OS_dds <- DESeq(ddsHTSeq)
+# How the data look like
+OS_dds
+# Calculate the size factor of DESeq data
+sizeFactors(OS_dds)
+# Check the results
+resultsNames(OS_dds) # compare with relevel factor MG63:"Intercept"         "cell_HOS_vs_MG63"  "cell_U2OS_vs_MG63"
+
+save(OS_dds, ddsHTSeq, TFs_list, Epifactor_list, experiment_design, file = file.path(plots_dir, "DESeq2DataSet_cell.rda"))
+# load(file = file.path(plots_dir, "DESeq2DataSet_cell.rda"))
+
+```
+
+# 2.3. Visualization 
+```{r, appendix = TRUE}
+# load(file = file.path(plots_dir, "DESeq2DataSet_cell.rda"))
+
+## Perform a rlog transformation on count data (log2 scale) to assume a normal distribution 
+# the VST and the rlog are to remove the dependence of the variance on the mean, particularly 
+# the high variance of the logarithm of count data when the mean is low to remove experiment-wide trend. 
+vsd <- vst(ddsHTSeq, blind=FALSE)
+rld <- rlog(ddsHTSeq, blind=FALSE)
+head(assay(vsd), 3)
+# Data transformations and visualization
+df <- bind_rows(as_tibble(log2(counts(OS_dds, normalized=TRUE)[, 1:2]+1)) %>% mutate(transformation = "log2(x + 1)"),
+                as_tibble(assay(vsd)[, 1:2]) %>% mutate(transformation = "vst"),
+                as_tibble(assay(rld)[, 1:2]) %>% mutate(transformation = "rlog"))
+colnames(df)[1:2] <- c("x", "y")  
+lvls <- c("log2(x + 1)", "vst", "rlog")
+df$transformation <- factor(df$transformation, levels=lvls)
+# Plot the transformation
+ggplot(df, aes(x = x, y = y)) + geom_hex(bins = 80) +
+  coord_fixed() + facet_grid( . ~ transformation)
+ggsave(filename=file.path(plots_dir, "DESeq_df_transformation.pdf"))
+
+## Plot sample correlation heatmap
+# Computes pairwise correlations between experiment_design based on gene expression
+Sample_correlation <- cor(as.matrix(assay(rld)))  
+# Plot the sample correlation heatmap
+# pdf(filename="Results_HighLow/DESeq_sampleCorr_HM.pdf", units = 'in', width = 8, height = 8, res = 250)
+# Set color palette for figures
+colors <- colorRampPalette(c("white", "darkgreen"))(5)
+# Computes pairwise correlations between experiment_design based on gene expression
+Sample_correlation <- cor(as.matrix(assay(rld)))  
+# Sample correlation heatmap
+
+pdf(file=file.path(plots_dir,"DESeq_sampleCorr_HM.pdf"), height = 4.5, width = 5)
+pheatmap(Sample_correlation,
+         col=colors,
+         main="Sample Correlations")
+dev.off()
+
+## Plot distance between samples
+# Set color palette for figures
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")) )(255)
+# To ensure we have a roughly equal contribution from all genes, we use it on the VST data
+sampleDists <- dist(t(assay(vsd)))
+# Sample distance heatmap
+sampleDistMatrix <- as.matrix(sampleDists)
+# rownames(sampleDistMatrix) <- paste(vsd$cell, vsd$replicate, sep="-")
+# colnames(sampleDistMatrix) <- NULL
+# heatmap of distance between samples
+pdf(file=file.path(plots_dir, "DESeq_sampleDist_HM.pdf"))
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists, 
+         clustering_distance_cols=sampleDists,
+         col=colors,
+         main="Sample to Sample Distances")
+dev.off()
+
+## Principal Component Analysis plot of the samples
+# Separates experiment_design based on variation between sample's gene expression greater variation will affect separation to a greater degree
+# plotted(vsd, intgroup=c("cell", "replicate"))
+data <- plotPCA(vsd, intgroup=c("cell"), returnData=TRUE)
+percentVar <- round(100 * attr(data, "percentVar"))
+# plot PCA with ggplot2 package
+ggplot(data, aes(PC1, PC2, color=cell, shape = replicate)) +
+  geom_point(size=3.5) +
+#  geom_text_repel(aes(label = paste0(cell, "_rep", replicate)),
+#                  box.padding = 0.4, point.padding = 0.5, 
+#                  min.segment.length = 0,) +
+  scale_colour_manual(values = c("MG63"="#56B4E9", "U2OS"="#F66239", "HOS"="#8332FF")) +
+  theme_bw() +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  ggtitle("")
+ggsave(filename=file.path(plots_dir, "DESeq_PCA.pdf"), width = 4.5, height = 3.5, dpi = 600)
+
+## Write normalized counts to file
+normalized.counts <- as.data.frame(counts(OS_dds, normalized=TRUE ))
+head(rownames(normalized.counts))
+# rownames(normalized.counts) <- sub("\\.[0-9]*", "", rownames(normalized.counts))
+head(normalized.counts)
+# Dont know why write.xlsx isn't work with rowName=T
+normalized.counts1 <- cbind("GeneName"=rownames(normalized.counts), normalized.counts) 
+# write.xlsx(normalized.counts1, filename=file.path(plots_dir,"RNAseq_normalize.count_Osteosarcoma_Filtering.xlsx"))
+```
+
+# 3. Differential expression analysis and Visualization
+
+```{r}
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(ggtext)
+library(ggrastr)
+library(dplyr)
+library(tibble)
+library(openxlsx)
+
+# ===== Step 1: Prepare DESeq2 results =====
+prepare_data_deseq <- function(res, tf_list, lfc_cut = 1, padj_cut = 0.05) {
+  # Handle both results object and data.frame
+  if (class(res)[1] == "DESeqResults") {
+    res <- as.data.frame(res)
+  }
+  # Geneid from rownames if not a column
+  if (!"Geneid" %in% colnames(res)) {
+    res$Geneid <- rownames(res)
+  }
+
+  res %>%
+    filter(!is.na(padj)) %>%
+    mutate(GeneSymbol = Geneid,
+           log2_fold_change = log2FoldChange,
+           p_value = pvalue,
+           p_adj = padj,
+           TF = if_else(GeneSymbol %in% tf_list, "YES", "NO"),
+           Expression = case_when(
+             padj <= padj_cut & log2FoldChange >= lfc_cut & TF == "YES" ~ "TF_Upregulated",
+             padj <= padj_cut & log2FoldChange <= -lfc_cut & TF == "YES" ~ "TF_Downregulated",
+             padj <= padj_cut & log2FoldChange >= lfc_cut ~ "Upregulated",
+             padj <= padj_cut & log2FoldChange <= -lfc_cut ~ "Downregulated",
+             TRUE ~ "Not_significant"))
+}
+
+# ===== Step 2: Classify TF expression status =====
+prepare_labels_deseq <- function(df, genes_of_interest) {
+  df %>%
+    dplyr::filter(GeneSymbol %in% genes_of_interest) %>%
+    mutate(label_color = case_when(
+      Expression == "TF_Upregulated" ~ "red",
+      Expression == "TF_Downregulated" ~ "blue",
+      Expression == "Upregulated" ~ "red",
+      Expression == "Downregulated" ~ "blue",
+      TRUE ~ "grey"))
+}
+
+# ===== Step 3: Plot volcano =====
+plot_volcano_deseq <- function(res_df, label_df, title, group_left = "U2OS", group_right = "MG63") {
+  num_up <- sum(res_df$Expression %in% c("Upregulated", "TF_Upregulated"))
+  num_down <- sum(res_df$Expression %in% c("Downregulated", "TF_Downregulated"))
+  tf_up <- sum(res_df$Expression == "TF_Upregulated")
+  tf_down <- sum(res_df$Expression == "TF_Downregulated")
+  # Sub titles
+  subtitle_text <- paste0(
+    "<span style='color:#3182bd;'>Up in ", group_left, ": ", num_down, "</span>",
+    " | <span style='color:#fc9272;'>Up in ", group_right, ": ", num_up, "</span><br>",
+    "<span style='color:blue;'>TF in ", group_left, ": ", tf_down, "</span>",
+    " | <span style='color:red;'>TF in ", group_right, ": ", tf_up, "</span>")
+  # add label sign
+  label_sig <- label_df %>% dplyr::filter(label_color %in% c("red", "blue"))
+  # add more level for DEGs count
+  res_df <- res_df %>%
+    mutate(Expression = factor(Expression,
+                               levels = c("Not_significant", "Upregulated", "Downregulated",
+                                          "TF_Upregulated", "TF_Downregulated"))) %>%
+    arrange(Expression)
+  # Plot Volcano
+  ggplot(res_df, aes(x = log2_fold_change, y = -log10(p_adj))) +
+    geom_point(aes(color = Expression), size = 1.5, alpha = 0.6) +
+    scale_color_manual(values = c("Upregulated" = "#fcbba1",
+                                  "Downregulated" = "#3182bd",
+                                  "Not_significant" = "grey",
+                                  "TF_Upregulated" = "red",
+                                  "TF_Downregulated" = "blue"),
+                       labels = c("Upregulated" = "Up",
+                                  "Downregulated" = "Down",
+                                  "Not_significant" = "NS",
+                                  "TF_Upregulated" = "TF Up",
+                                  "TF_Downregulated" = "TF Down")) +
+    geom_label_repel(data = label_sig,
+                     aes(label = GeneSymbol, color = Expression),
+                     fill = "white", size = 3, box.padding = 0.5,
+                     point.padding = 0, min.segment.length = 0,
+                     segment.color = "gray50", segment.size = 0.4,
+                     max.overlaps = 20, force = 5, force_pull = 0.3,
+                     direction = "both", show.legend = FALSE) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+    theme_minimal() +
+    labs(title = title, subtitle = subtitle_text,
+         x = expression(log[2]~Fold~Change),
+         y = expression(-log[10]~(padj)),
+         color = "Expression") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_markdown(hjust = 0.5))
+}
+
+# ===== Step 4: Attach raw counts + group means to the results table =====
+# contrast_var = the colData(dds) column used in your DESeq2 contrast (e.g. "cell")
+# group_left / group_right must match the labels you pass to plot_volcano_deseq()
+add_expression_data <- function(res_df, dds, contrast_var, group_left, group_right) {
+  coldata <- as.data.frame(colData(dds))
+  samples_left  <- rownames(coldata)[coldata[[contrast_var]] == group_left]
+  samples_right <- rownames(coldata)[coldata[[contrast_var]] == group_right]
+
+  raw_counts  <- counts(dds, normalized = FALSE)
+  norm_counts <- counts(dds, normalized = TRUE)
+
+  # per-sample raw counts (just the two groups in this comparison)
+  raw_df <- as.data.frame(raw_counts[, c(samples_left, samples_right)]) %>%
+    rownames_to_column("Geneid") %>%
+    rename_with(~paste0("raw_", .), -Geneid)
+
+  # per-sample normalized counts (better basis for cross-sample comparison/means)
+  norm_df <- as.data.frame(norm_counts[, c(samples_left, samples_right)]) %>%
+    rownames_to_column("Geneid") %>%
+    rename_with(~paste0("norm_", .), -Geneid)
+
+  means_df <- data.frame(
+    Geneid     = rownames(norm_counts),
+    mean_left  = rowMeans(norm_counts[, samples_left,  drop = FALSE]),
+    mean_right = rowMeans(norm_counts[, samples_right, drop = FALSE])
+  )
+  names(means_df)[2] <- paste0("mean_norm_", group_left)
+  names(means_df)[3] <- paste0("mean_norm_", group_right)
+
+  res_df %>%
+    left_join(means_df, by = "Geneid") %>%
+    left_join(norm_df,  by = "Geneid") %>%
+    left_join(raw_df,   by = "Geneid")
+}
+
+# ===== Step 5: Write a tidy, multi-sheet workbook =====
+write_volcano_excel <- function(res_df, label_df, file_path) {
+  sig_df <- res_df %>% filter(Expression != "Not_significant")
+
+  wb <- createWorkbook()
+  addWorksheet(wb, "All_genes")
+  addWorksheet(wb, "Significant_DEGs")
+  addWorksheet(wb, "Labeled_TFs")
+
+  writeData(wb, "All_genes",        res_df,   withFilter = TRUE)
+  writeData(wb, "Significant_DEGs", sig_df,   withFilter = TRUE)
+  writeData(wb, "Labeled_TFs",      label_df, withFilter = TRUE)
+
+  for (s in c("All_genes", "Significant_DEGs", "Labeled_TFs")) {
+    freezePane(wb, s, firstRow = TRUE)
+    setColWidths(wb, s, cols = 1:ncol(res_df), widths = "auto")
+  }
+
+  saveWorkbook(wb, file_path, overwrite = TRUE)
+}
+
+# ===== Usage =====
+# List of gene from TF database (Cell2018 FengZhang)
+tf_list <- TFs_list$Name
+# List of genes to label on the plot
+genes_to_label <- c("BNC2", "FOXF1", "NFIX",  "JUNB", "TCF21",  "NFIB",
+                    "RUNX2","NFIA", "FLI1", "TP53", "MYBL2", "TEAD4")
+
+# HOS vs MG63
+results_HOS_MG63 <- results(OS_dds, contrast = c("cell", "HOS", "MG63"), alpha = 0.05)
+
+res_HOS_MG63 <- prepare_data_deseq(results_HOS_MG63, tf_list)
+res_HOS_MG63 <- add_expression_data(res_HOS_MG63, OS_dds,
+                                     contrast_var = "cell",   # colData column used in the contrast above
+                                     group_left = "MG63", group_right = "HOS")
+labels_HOS_MG63 <- prepare_labels_deseq(res_HOS_MG63, genes_to_label)
+
+write_volcano_excel(res_HOS_MG63, labels_HOS_MG63,
+                     file.path(plots_dir, "RNAseq_results_HOS_MG63_NEW.xlsx"))
+
+plot_HOS_MG63 <- plot_volcano_deseq(res_HOS_MG63, labels_HOS_MG63,
+                          title = "HOS vs MG63",
+                          group_left = "MG63", group_right = "HOS")
+plot_HOS_MG63
+plot_HOS_MG63_raster <- ggrastr::rasterise(plot_HOS_MG63, layers = "Point", dpi = 600)
+ggsave(file.path(plots_dir, "Volcano_HOS_vs_MG63_NEW.pdf"), plot_HOS_MG63_raster, width = 7, height = 6)
+
+
+
+
+# List of gene
+genes_to_label <- c("BNC2", "AHR", "NFIX",  "JUNB", "TCF21", "EPAS1", "NFIB",
+                    "RUNX2","NFIA", "ZNF697",  "TP53", "MYBL2", "TEAD4")
+
+# U2OS vs MG63
+results_U2OS_MG63 <- results(OS_dds, contrast = c("cell", "U2OS", "MG63"), alpha = 0.05)
+
+res_U2OS_MG63 <- prepare_data_deseq(results_U2OS_MG63, tf_list)
+res_U2OS_MG63 <- add_expression_data(res_U2OS_MG63, OS_dds,
+                                     contrast_var = "cell",   # colData column used in the contrast above
+                                     group_left = "MG63", group_right = "U2OS")
+labels_U2OS_MG63 <- prepare_labels_deseq(res_U2OS_MG63, genes_to_label)
+
+write_volcano_excel(res_U2OS_MG63, labels_U2OS_MG63,
+                     file.path(plots_dir, "RNAseq_results_U2OS_MG63_NEW.xlsx"))
+
+plot_U2OS_MG63 <- plot_volcano_deseq(res_U2OS_MG63, labels_U2OS_MG63,
+                          title = "U2OS vs MG63",
+                          group_left = "MG63", group_right = "U2OS")
+plot_U2OS_MG63
+plot_U2OS_MG63_raster <- ggrastr::rasterise(plot_U2OS_MG63, layers = "Point", dpi = 600)
+ggsave(file.path(plots_dir, "Volcano_U2OS_vs_MG63_NEW.pdf"), plot_U2OS_MG63_raster, width = 7, height = 6)
+
+```
+
+
+
+
+```{r}
+library(clusterProfiler)
+library(msigdbr)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# ===== Get gene sets =====
+hallmark <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, gene_symbol)
+
+# ===== Prepare ranked gene lists (ALL genes, not just significant) =====
+prepare_ranked_list <- function(res) {
+  res_df <- as.data.frame(res)
+  res_df <- res_df[!is.na(res_df$stat), ]
+  gene_list <- sort(setNames(res_df$stat, rownames(res_df)), decreasing = TRUE)
+  return(gene_list)
+}
+
+gene_list_HOS <- prepare_ranked_list(results_HOS_MG63)
+gene_list_U2OS <- prepare_ranked_list(results_U2OS_MG63)
+
+# ===== GSEA Hallmark =====
+set.seed(42)
+gsea_hallmark_HOS <- GSEA(geneList = gene_list_HOS,
+                           TERM2GENE = hallmark,
+                           pvalueCutoff = 1, eps = 0)
+
+set.seed(42)
+gsea_hallmark_U2OS <- GSEA(geneList = gene_list_U2OS,
+                            TERM2GENE = hallmark,
+                            pvalueCutoff = 1, eps = 0)
+
+# ===== GSEA GO BP =====
+# Convert to Entrez for gseGO
+convert_to_entrez <- function(gene_list) {
+  mapping <- bitr(names(gene_list), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  mapped <- gene_list[names(gene_list) %in% mapping$SYMBOL]
+  names(mapped) <- mapping$ENTREZID[match(names(mapped), mapping$SYMBOL)]
+  mapped <- mapped[!is.na(names(mapped))]
+  sort(mapped, decreasing = TRUE)
+}
+
+gene_list_HOS_entrez <- convert_to_entrez(gene_list_HOS)
+gene_list_U2OS_entrez <- convert_to_entrez(gene_list_U2OS)
+
+set.seed(42)
+gsea_gobp_HOS <- gseGO(geneList = gene_list_HOS_entrez,
+                         OrgDb = org.Hs.eg.db,
+                         ont = "BP",
+                         pvalueCutoff = 0.05,
+                         eps = 0)
+
+set.seed(42)
+gsea_gobp_U2OS <- gseGO(geneList = gene_list_U2OS_entrez,
+                          OrgDb = org.Hs.eg.db,
+                          ont = "BP",
+                          pvalueCutoff = 0.05,
+                          eps = 0)
+
+# ===== Combined Hallmark dotplot =====
+h_HOS <- as.data.frame(gsea_hallmark_HOS) %>% mutate(Comparison = "HOS vs MG63")
+h_U2OS <- as.data.frame(gsea_hallmark_U2OS) %>% mutate(Comparison = "U2OS vs MG63")
+h_all <- bind_rows(h_HOS, h_U2OS)
+h_all$ID <- gsub("HALLMARK_", "", h_all$ID)
+
+# Common significant pathways
+common_h <- intersect(
+  h_HOS$ID[h_HOS$p.adjust < 0.05],
+  h_U2OS$ID[h_U2OS$p.adjust < 0.05]
+)
+
+h_plot <- h_all %>%
+  filter(ID %in% gsub("HALLMARK_", "", common_h)) %>%
+  group_by(ID) %>%
+  mutate(mean_NES = mean(abs(NES))) %>%
+  ungroup()
+
+# Top 15 by mean NES
+top_h <- h_plot %>%
+  distinct(ID, mean_NES) %>%
+  arrange(desc(mean_NES)) %>%
+  head(15) %>%
+  pull(ID)
+
+h_plot <- h_plot %>% filter(ID %in% top_h)
+h_plot$Comparison <- factor(h_plot$Comparison, levels = c("HOS vs MG63", "U2OS vs MG63"))
+
+p_hallmark <- ggplot(h_plot, aes(x = NES, y = reorder(ID, NES))) +
+  geom_point(aes(color = p.adjust, size = setSize)) +
+  facet_wrap(~ Comparison) +
+  scale_color_gradient(low = "red", high = "blue", name = "padj") +
+  scale_size_continuous(range = c(3, 8), name = "Gene set size") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  theme_bw() +
+  theme(strip.text = element_text(face = "bold"),
+        axis.text.y = element_text(size = 9)) +
+  labs(x = "Normalized Enrichment Score (NES)",
+       y = NULL,
+       title = "GSEA Hallmark")
+
+ggsave(file.path(plots_dir, "GSEA_Hallmark_HOS_U2OS_vs_MG63.pdf"), p_hallmark, width = 10, height = 6)
+
+# ===== Combined GO BP dotplot =====
+g_HOS <- as.data.frame(gsea_gobp_HOS) %>% mutate(Comparison = "HOS vs MG63")
+g_U2OS <- as.data.frame(gsea_gobp_U2OS) %>% mutate(Comparison = "U2OS vs MG63")
+g_all <- bind_rows(g_HOS, g_U2OS)
+
+common_g <- intersect(
+  g_HOS$Description[g_HOS$p.adjust < 0.05],
+  g_U2OS$Description[g_U2OS$p.adjust < 0.05]
+)
+
+g_plot <- g_all %>%
+  filter(Description %in% common_g) %>%
+  group_by(Description) %>%
+  mutate(mean_NES = mean(abs(NES))) %>%
+  ungroup()
+
+top_g <- g_plot %>%
+  distinct(Description, mean_NES) %>%
+  arrange(desc(mean_NES)) %>%
+  head(15) %>%
+  pull(Description)
+
+g_plot <- g_plot %>% filter(Description %in% top_g)
+g_plot$Comparison <- factor(g_plot$Comparison, levels = c("HOS vs MG63", "U2OS vs MG63"))
+
+p_gobp <- ggplot(g_plot, aes(x = NES, y = reorder(Description, NES))) +
+  geom_point(aes(color = p.adjust, size = setSize)) +
+  facet_wrap(~ Comparison) +
+  scale_color_gradient(low = "red", high = "blue", name = "padj") +
+  scale_size_continuous(range = c(3, 8), name = "Gene set size") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  theme_bw() +
+  theme(strip.text = element_text(face = "bold"),
+        axis.text.y = element_text(size = 9)) +
+  labs(x = "Normalized Enrichment Score (NES)",
+       y = NULL,
+       title = "GSEA GO Biological Process")
+
+ggsave(file.path(plots_dir, "GSEA_GOBP_HOS_U2OS_vs_MG63.pdf"), p_gobp, width = 12, height = 6)
+
+# ===== Save results =====
+wb <- createWorkbook()
+addWorksheet(wb, "Hallmark_HOS")
+writeData(wb, "Hallmark_HOS", h_HOS)
+addWorksheet(wb, "Hallmark_U2OS")
+writeData(wb, "Hallmark_U2OS", h_U2OS)
+addWorksheet(wb, "GOBP_HOS")
+writeData(wb, "GOBP_HOS", g_HOS)
+addWorksheet(wb, "GOBP_U2OS")
+writeData(wb, "GOBP_U2OS", g_U2OS)
+saveWorkbook(wb, file.path(plots_dir, "GSEA_Hallmark_GOBP_results.xlsx"), overwrite = TRUE)
+
+```
+
+
+
+
+
