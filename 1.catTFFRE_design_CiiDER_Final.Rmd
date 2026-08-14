@@ -1,0 +1,714 @@
+---
+title: "Predicted vs CiiDER readout — Clone C1 vs Control C4"
+author: "XuanThangNguyen"
+date: "`r Sys.Date()`"
+output: pdf
+---
+# Goal
+
+Compare the **predicted** TF binding sites engineered into clone **C1** (sheet `catTFRE_design`)
+against the **CiiDER readout** of motifs detected in C1 versus the control clone
+**C4** (sheet `CiiDER_results`). Quantify how well the design is recovered, test whether
+designed TFs are preferentially enriched, and visualize the comparison.
+
+CiiDER reports binding-site counts as ordinal bins:
+
+| symbol | sites    | ordinal |
+|--------|----------|---------|
+| Na     | 0        | 0       |
+| \*     | 1–10     | 1       |
+| \*\*   | 10–20    | 2       |
+| \*\*\* | 20–50    | 3       |
+| \*\*\*\*| > 50    | 4       |
+
+# Packages
+
+
+```{r packages, include=FALSE}
+# Set directory paths
+root_dir <- rprojroot::find_root(rprojroot::has_dir("catTFRE_MS_FinalRound"))
+analysis_dir <- file.path(root_dir, "catTFRE_MS_FinalRound")
+plots_dir <- file.path(analysis_dir, "catTFRE_CiiDER")
+# Create plots_dir if it doesn't exist
+if (!dir.exists(plots_dir)) {dir.create(plots_dir, recursive = TRUE)}
+
+
+require_packages <- c("readxl","dplyr","tidyr","stringr","purrr","ggplot2", "ggalluvial", "patchwork","scales","openxlsx")
+to_install <- setdiff(require_packages, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+invisible(lapply(require_packages, library, character.only = TRUE))
+theme_set(theme_classic(base_size = 10) +
+          theme(plot.title = element_text(face = "bold")))
+```
+
+# Load and clean
+
+```{r load}
+# catTFRE_design starts the table on the second row (first row is the supplemental caption)
+catTFRE_design <- read_excel(file.path(analysis_dir, "catTFRE_CiiDER.xlsx"), sheet = "S1A", skip = 1) %>%
+  rename_with(~ str_trim(.x)) %>%
+  mutate(across(where(is.character), str_trim))
+
+# CiiDER_results starts the table on the third row (caption + legend above)
+CiiDER_results <- read_excel(file.path(analysis_dir, "catTFRE_CiiDER.xlsx"), sheet = "S1B", skip = 2) %>%
+  rename_with(~ str_trim(.x)) %>%
+  mutate(across(where(is.character), str_trim))
+
+glimpse(catTFRE_design)
+glimpse(CiiDER_results)
+head(CiiDER_results)
+```
+
+```{r encode}
+star_ord <- c("NA" = 0, "*" = 1, "**" = 2, "***" = 3, "****" = 4)
+star_lab <- c("NA","*","**","***","****")
+
+# Normalize the star strings before lookup. Handles every variation we've seen:
+#   - leading / trailing / internal whitespace ("Na ", "Na\t", " * ")
+#   - any casing of NA literal (Na, NA, nA, na) and true R NA
+#   - empty strings, "0", and "-" are treated as NA-like
+#   - factor inputs (coerced to character first)
+# Anything that doesn't match one of {NA, *, **, ***, ****} after this is left untouched
+normalize_star <- function(x) {
+  x <- as.character(x)                               # factor / logical → character
+  x <- str_replace_all(x, "\\s+", "")                # strip ALL whitespace
+  na_like <- is.na(x) |
+             toupper(x) %in% c("NA","N/A","NAN") |
+             x %in% c("", "0", "-", ".")
+  x[na_like] <- "NA"
+  x
+}
+
+CiiDER_results <- CiiDER_results %>%
+  mutate(Clone_C1 = normalize_star(Clone_C1),
+         Clone_C4 = normalize_star(Clone_C4),
+         C1_ord   = unname(star_ord[Clone_C1]),
+         C4_ord   = unname(star_ord[Clone_C4]),
+         delta    = C1_ord - C4_ord)
+
+# every value must have mapped to 0–4. If any are NA, the original string didn't match NA/*/**/***/**** will be stop
+bad <- CiiDER_results %>% filter(is.na(C1_ord) | is.na(C4_ord))
+if (nrow(bad) > 0) { print(unique(c(bad$Clone_C1, bad$Clone_C4)))
+  stop("Unmapped star strings found — extend normalize_star() / star_ord.")
+}
+
+# Show the mapping so you can eyeball that Na → 0 (and nothing else slipped in).
+cat("C1 mapping (raw symbol → ordinal → row count):\n")
+CiiDER_results %>% dplyr::count(Clone_C1, C1_ord) %>% arrange(C1_ord) %>% print()
+cat("\nC4 mapping:\n")
+CiiDER_results %>% dplyr::count(Clone_C4, C4_ord) %>% arrange(C4_ord) %>% print()
+
+# Split dimer / paralog names so we can match on any component.
+# Strips parentheticals: JUND(Var.2) → JUND.
+# Drops all-digit TFs defensively: 
+# Examples handled: "ARNT::HIF1A", "KLF16--SP3", "JUND(Var.2)",
+#                   "HOXA13--HOXD13", "NKX3-2" (kept whole).
+split_name <- function(x) {
+  x %>%
+    str_replace_all("\\(.*?\\)", "") %>%
+    str_split("::|--") %>%
+    map(~ toupper(str_trim(.x))) %>%
+    map(~ .x[nzchar(.x) & !grepl("^[0-9]+$", .x)])
+}
+catTFRE_design$parts <- split_name(catTFRE_design$TF)
+CiiDER_results$parts <- split_name(CiiDER_results$TF)
+
+# Diagnostic — eyeball that every TF is a real TF and the count matches what you expect. 
+designed_TFs_preview <- sort(unique(unlist(catTFRE_design$parts)))
+cat(sprintf("Designed TFs: %d unique\n", length(designed_TFs_preview)))
+cat("All TFs:\n")
+print(designed_TFs_preview)
+stopifnot("Phantom digit-only TF detected — check S1A renaming" =
+          !any(grepl("^[0-9]+$", designed_TFs_preview)))
+
+designed_TFs <- unique(unlist(catTFRE_design$parts))
+# vapply avoid any tidy-evaluation surprises.
+CiiDER_results$Designed <- vapply(CiiDER_results$parts,
+                       function(x) any(x %in% designed_TFs),
+                       logical(1))
+
+# Quick sanity check: not everything should be flagged as designed.
+stopifnot("Designed flag must vary CiiDER_results" =
+          length(unique(CiiDER_results$Designed)) == 2)
+```
+
+# Per-designed-TF recovery
+```{r recovery}
+lookup_best <- function(query_parts, db = CiiDER_results) {
+  hit <- vapply(db$parts, function(x) any(x %in% query_parts), logical(1))
+  if (!any(hit))
+    return(tibble(CiiDER  = FALSE,
+                  C1_ord     = 0L, C4_ord = 0L, delta = 0L,
+                  best_match = NA_character_))
+  hits <- db[hit, , drop = FALSE]
+  best <- hits[which.max(hits$C1_ord), , drop = FALSE]
+  tibble(CiiDER  = TRUE,
+         C1_ord     = as.integer(best$C1_ord),
+         C4_ord     = as.integer(best$C4_ord),
+         delta      = as.integer(best$C1_ord - best$C4_ord),
+         best_match = best$TF)
+}
+
+ud <- catTFRE_design %>%
+  distinct(TF, .keep_all = TRUE) %>%
+  mutate(rec = map(parts, lookup_best)) %>%
+  unnest_wider(rec) %>%
+  mutate(C1_bin           = star_lab[C1_ord + 1L],
+         C4_bin           = star_lab[C4_ord + 1L],
+         Detected_C4      = C4_ord >= 1,
+         Detected_C1      = C1_ord >= 1,
+         Strong_C1        = C1_ord >= 3,
+         Strong_C4        = C4_ord >= 3,
+         `Enriched_C1>C4` = delta  > 0)
+
+# scoping bug returning a constant for every TF).
+stopifnot("C1_ord must vary across designed TFs" = length(unique(ud$C1_ord)) > 1,
+          "CiiDER must vary across designed TFs" = length(unique(ud$CiiDER)) >= 1 && !all(ud$CiiDER & ud$C1_ord == max(ud$C1_ord)))
+
+# Show how every designed TF was classified.
+cat("Designed-TF C1 bin breakdown:\n")
+ud %>%
+  dplyr::count(C1_bin) %>%
+  mutate(C1_bin = factor(C1_bin, levels = star_lab)) %>%
+  arrange(C1_bin) %>%
+  print()
+
+cat("\nDetection summary:\n")
+ud %>%
+  summarise(n_total      = n(),
+            n_CiiDER  = sum(CiiDER),
+            n_detected   = sum(Detected_C4),       # C4 >= *
+            n_detected   = sum(Detected_C1),       # C1 >= *
+            n_strong_C4  = sum(Strong_C4),         # C1 >= ***
+            n_strong_C1  = sum(Strong_C1),         # C1 >= ***
+            n_enriched   = sum(`Enriched_C1>C4`)) %>%
+  print()
+
+ud %>% head(10)
+```
+
+
+
+
+# Statistics
+
+```{r stats}
+mw_alt <- wilcox.test(CiiDER_results$C1_ord[CiiDER_results$Designed],
+                      CiiDER_results$C1_ord[!CiiDER_results$Designed],
+                      alternative = "greater")
+
+wsr <- wilcox.test(CiiDER_results$C1_ord[CiiDER_results$Designed],
+                   CiiDER_results$C4_ord[CiiDER_results$Designed],
+                   paired = TRUE, alternative = "greater")
+
+TF_lookup_best <- function(tok, db = CiiDER_results) {
+  hit <- vapply(db$parts, function(x) tok %in% x, logical(1))
+  if (!any(hit)) return(tibble(in_CiiDER = FALSE, C1_ord = 0L, C4_ord = 0L,
+                               best_match = NA_character_))
+  hits <- db[hit, , drop = FALSE]
+  best <- hits[which.max(hits$C1_ord), , drop = FALSE]
+  tibble(in_CiiDER  = TRUE,
+         C1_ord     = as.integer(best$C1_ord),
+         C4_ord     = as.integer(best$C4_ord),
+         best_match = best$TF)
+}
+
+ud_TF <- tibble(TF = sort(unique(unlist(catTFRE_design$parts)))) %>%
+  mutate(rec = map(TF, TF_lookup_best)) %>%
+  unnest_wider(rec) %>%
+  mutate(C1_bin           = star_lab[C1_ord + 1L],
+         C4_bin           = star_lab[C4_ord + 1L],
+         Detected_C4      = C4_ord >= 1,
+         Detected_C1      = C1_ord >= 1,
+         Strong_C4        = C4_ord >= 3,
+         Strong_C1        = C1_ord >= 3,
+         `Enriched_C1>C4` = (C1_ord - C4_ord) > 0)
+
+cat(sprintf("TF-level denominator: %d unique TFs (vs %d S1A labels)\n",
+            nrow(ud_TF), nrow(ud)))
+
+# --- Design-level (TF-level) contingency tables --------------------------
+# Designed row: UNIQUE designed TFs (n=126).
+# Not-designed row: CiiDER motifs whose parts share NO TF with any design.
+n_des_C1_sig    <- sum(ud_TF$Detected_C1)
+n_des_C1_notsig <- sum(!ud_TF$Detected_C1)
+n_nd_C1_sig     <- sum(!CiiDER_results$Designed & CiiDER_results$C1_ord >= 1)
+n_nd_C1_notsig  <- sum(!CiiDER_results$Designed & CiiDER_results$C1_ord == 0)
+tab_C1 <- matrix(c(n_des_C1_sig,    n_des_C1_notsig,
+                   n_nd_C1_sig,     n_nd_C1_notsig),
+                 nrow = 2, byrow = TRUE,
+                 dimnames = list(Designed = c("Designed (unique TFs)","Not designed"),
+                                 C1_sig   = c("Detected (≥*)","Not detected (NA)")))
+fish_C1    <- fisher.test(tab_C1, alternative = "greater")
+recall_C1  <- n_des_C1_sig / (n_des_C1_sig + n_des_C1_notsig)
+nd_rate_C1 <- n_nd_C1_sig / (n_nd_C1_sig + n_nd_C1_notsig)
+
+n_des_C4_sig    <- sum(ud_TF$Detected_C4)
+n_des_C4_notsig <- sum(!ud_TF$Detected_C4)
+n_nd_C4_sig     <- sum(!CiiDER_results$Designed & CiiDER_results$C4_ord >= 1)
+n_nd_C4_notsig  <- sum(!CiiDER_results$Designed & CiiDER_results$C4_ord == 0)
+tab_C4 <- matrix(c(n_des_C4_sig,    n_des_C4_notsig,
+                   n_nd_C4_sig,     n_nd_C4_notsig),
+                 nrow = 2, byrow = TRUE,
+                 dimnames = list(Designed = c("Designed (unique TFs)","Not designed"),
+                                 C4_sig   = c("Detected (≥*)","Not detected (NA)")))
+fish_C4   <- fisher.test(tab_C4, alternative = "greater")
+recall_C4 <- n_des_C4_sig / (n_des_C4_sig + n_des_C4_notsig)
+
+cat("\nTF-level contingency C1:\n"); print(tab_C1)
+cat("\nTF-level contingency C4:\n"); print(tab_C4)
+
+stats_tbl <- tibble(
+  Metric = c("Designed TFS (unique, denominator)",
+             "  └ S1A labels (for reference)",
+             "Detected in C4 (TF best ≥*)",
+             "Detected in C1 (TF best ≥*)",
+             "Strong in C4 (TF best ≥***)",
+             "Strong in C1 (TF best ≥***)",
+             "Enriched C1 > C4 (TF-level)",
+             sprintf("Recall C1 = detected / %d TFs", nrow(ud_TF)),
+             sprintf("Recall C4 = detected / %d TFs", nrow(ud_TF)),
+             "Non-designed CiiDER motifs sig in C1 (rate)",
+             "Mann-Whitney p (designed > non-designed C1)",
+             "Wilcoxon paired p (designed C1 > C4)",
+             "Fisher OR  C1 (TF-level)",
+             "Fisher p   C1",
+             "Fisher OR  C4 (TF-level)",
+             "Fisher p   C4"),
+  Value = c(nrow(ud_TF),
+            nrow(ud),
+            sum(ud_TF$Detected_C4),
+            sum(ud_TF$Detected_C1),
+            sum(ud_TF$Strong_C4),
+            sum(ud_TF$Strong_C1),
+            sum(ud_TF$`Enriched_C1>C4`),
+            sprintf("%.2f", recall_C1),
+            sprintf("%.2f", recall_C4),
+            sprintf("%d / %d (%.1f%%)", n_nd_C1_sig,
+                    n_nd_C1_sig + n_nd_C1_notsig, nd_rate_C1 * 100),
+            signif(mw_alt$p.value, 3),
+            signif(wsr$p.value, 3),
+            sprintf("%.2f", fish_C1$estimate),
+            signif(fish_C1$p.value, 3),
+            sprintf("%.2f", fish_C4$estimate),
+            signif(fish_C4$p.value, 3)))
+stats_tbl
+```
+
+# Plots
+## A. Recovery C1/C4
+```{r panelA}
+casc <- tibble(
+  cat = factor(c("Designed","CiiDER\ntable","Detected\n(C4≥*)","Detected\n(C1≥*)",
+                 "Strong\n(C4≥***)","Strong\n(C1≥***)","Enriched\nC1>C4"),
+               levels = c("Designed","CiiDER\ntable","Detected\n(C4≥*)","Detected\n(C1≥*)",
+                          "Strong\n(C4≥***)","Strong\n(C1≥***)","Enriched\nC1>C4")),
+  n   = c(nrow(ud_TF),
+          sum(ud_TF$in_CiiDER),
+          sum(ud_TF$Detected_C4),
+          sum(ud_TF$Detected_C1),
+          sum(ud_TF$Strong_C4),
+          sum(ud_TF$Strong_C1),
+          sum(ud_TF$`Enriched_C1>C4`))) %>%
+  mutate(pct = n / nrow(ud_TF) * 100,
+         lbl = sprintf("%d\n(%.0f%%)", n, pct))
+
+pA <- ggplot(casc, aes(cat, n, fill = cat)) +
+  geom_col(color = "black", linewidth = 0.3, show.legend = FALSE) +
+  geom_text(aes(label = lbl), vjust = -0.2, size = 3) +
+  scale_fill_manual(values = c("#444444","#888888","#2ca02c","#2ca02c",
+                               "#1f77b4","#1f77b4","#d62728")) +
+  ylim(0, nrow(ud_TF) * 1.2) +
+  labs(title    = "A. Recovery of designed TFs (TF-level)",
+       subtitle = sprintf("Denominator = %d unique TFs (after splitting %d S1A labels' dimers)",
+                          nrow(ud_TF), nrow(ud)),
+       x = NULL, y = "Designed TFs (n)") +
+  theme(plot.subtitle = element_text(size = 8, color = "grey25"))
+ggsave(pA, file = file.path(plots_dir, "catTFRE_design_CiiDER_comparison.pdf"), height = 4, width = 4.5)
+```
+
+## B. C1 distribution: designed vs non-designed
+```{r panelB}
+# IMPORTANT: the Designed group is now TF-level (ud_TF, n=126). The Non-designed group stays at CiiDER row level (n=571) 
+n_des    <- nrow(ud_TF)                          # 126
+n_nondes <- sum(!CiiDER_results$Designed)         # 571
+
+# Designed side: one row per unique designed TF, using its best matching
+# CiiDER row's bin (already stored in ud_TF$C4_ord / C1_ord).
+des_long <- bind_rows(ud_TF %>% transmute(ord = C4_ord, Clone = "C4"),
+                      ud_TF %>% transmute(ord = C1_ord, Clone = "C1")) %>% mutate(Designed = TRUE)
+
+# Non-designed side: each CiiDER motif row that shares no TF with any design.
+nondes_long <- bind_rows(CiiDER_results %>% filter(!Designed) %>% transmute(ord = C4_ord, Clone = "C4"),
+                         CiiDER_results %>% filter(!Designed) %>% transmute(ord = C1_ord, Clone = "C1")) %>% 
+               mutate(Designed = FALSE)
+
+distB <- bind_rows(des_long, nondes_long) %>%
+  dplyr::count(Clone, Designed, ord) %>%
+  group_by(Clone, Designed) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup() %>%
+  mutate(group   = ifelse(Designed,
+                          sprintf("Designed\n(n=%d)", n_des),
+                          sprintf("Non-designed\n(n=%d)", n_nondes)),
+         bin_lab = factor(star_lab[ord + 1L], levels = star_lab),
+         Clone   = factor(Clone, levels = c("C4", "C1")))   # C4 left, C1 right
+
+pB <- ggplot(distB, aes(group, pct, fill = bin_lab)) +
+  geom_col(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = ifelse(pct > 4, n, "")),
+            position = position_stack(vjust = 0.5),
+            size = 2.6, color = "white") +
+  facet_wrap(~ Clone, nrow = 1) +
+  scale_fill_manual(values = c("#dddddd","#bcd2e8","#7ba9d6","#3a7cbe","#0d3b66"),
+                    name = "Bin") +
+  labs(title    = "B. CiiDER bin distribution (designed vs non-designed)",
+       subtitle = sprintf("Designed = %d unique TFs · \nNon-designed = %d CiiDER motifs ·\n Mann-Whitney p = %.1e",
+                          n_des, n_nondes,
+                          wilcox.test(ud_TF$C1_ord,
+                                      CiiDER_results$C1_ord[!CiiDER_results$Designed],
+                                      alternative = "greater")$p.value),
+       x = NULL, y = "% of TFs") +
+  theme_classic(base_size = 10) +
+  theme(strip.background = element_rect(fill = "grey92", color = NA),
+        strip.text       = element_text(face = "bold", size = 10),
+        plot.title       = element_text(face = "bold", size = 11),
+        plot.subtitle    = element_text(size = 8.5, color = "grey25"),
+        legend.position  = "right")
+pB
+ggsave(pB, file = file.path(plots_dir,"catTFRE_C1_C4_design_CiiDER_designed_nonDesigned.pdf"), height = 4, width = 4.5)
+
+```
+
+## C. C1 vs C4 slope chart for designed TFs
+
+```{r panelC}
+# === TF-level alluvial ===================================================
+# Now uses ud_TF (one row per UNIQUE designed TF TF, n=126),
+flow_src <- ud_TF
+
+# Step 1: aggregate transitions so each ribbon = ONE merged stream
+flow_df <- flow_src %>%
+  dplyr::count(C4_bin, C1_bin, name = "n_TFs") %>%
+  mutate(C4_bin    = factor(C4_bin, levels = star_lab),
+         C1_bin    = factor(C1_bin, levels = star_lab),
+         direction = case_when(as.integer(C1_bin) > as.integer(C4_bin) ~ "C1 > C4 (gained)",
+                               as.integer(C1_bin) < as.integer(C4_bin) ~ "C1 < C4 (lost)",
+                               TRUE                                    ~ "C1 = C4 (no change)"))
+ 
+# Step 2: pre-compute stratum label positions so we can place "Na (n=50)"
+# OUTSIDE the bars (avoids the n=3 collision you saw).
+make_strat_labels <- function(bin_col, axis_x) {
+  flow_src %>%
+    dplyr::count(bin = .data[[bin_col]]) %>%
+    mutate(bin = factor(bin, levels = star_lab)) %>%
+    complete(bin, fill = list(n = 0)) %>%
+    arrange(desc(bin)) %>%                 # **** first → bottom of plot
+    mutate(cum_top = cumsum(n),
+           y       = cum_top - n / 2,
+           x       = axis_x) %>%
+    filter(n > 0)
+}
+strat_lab <- bind_rows(make_strat_labels("C4_bin", 1) %>% mutate(hjust = 1.15),  # nudge left
+                       make_strat_labels("C1_bin", 2) %>% mutate(hjust = -0.15))  # nudge right
+
+ 
+pC <- ggplot(flow_df, aes(axis1 = C4_bin, axis2 = C1_bin, y = n_TFs)) +
+  geom_alluvium(aes(fill = direction), alpha = 0.78,
+                width = 0.18, knot.pos = 0.40,
+                color = "white", linewidth = 0.3) +
+  geom_stratum(width = 0.18, fill = "grey92", color = "grey40", linewidth = 0.4) +
+  # External labels (bin + count) — placed via x/y, NOT stat="stratum"
+  geom_text(data        = strat_lab,
+            aes(x = x, y = y, label = sprintf("%s (n=%d)", bin, n), hjust = hjust),
+            size = 2.7, inherit.aes = FALSE) +
+  scale_x_continuous(breaks = c(1, 2),
+                     labels = c("C4\n(control)", "C1\n(designed)"),
+                     limits = c(0.45, 2.55), expand = c(0, 0)) +
+  scale_fill_manual(values = c("C1 > C4 (gained)"    = "#d62728",
+                               "C1 < C4 (lost)"      = "#1f77b4",
+                               "C1 = C4 (no change)" = "#bdbdbd"),
+                    name = NULL,
+                    breaks = c("C1 > C4 (gained)",
+                               "C1 = C4 (no change)",
+                               "C1 < C4 (lost)")) +
+  labs(title    = "C. Shift in CiiDER bin (C4 → C1)",
+       subtitle = sprintf("%d / %d designed TFs gained signal  Wilcoxon p = %.1e",
+                          sum(flow_src$`Enriched_C1>C4`),
+                          nrow(flow_src), wsr$p.value),
+       x = NULL, y = NULL) +
+  theme_classic(base_size = 10) +
+  theme(legend.position    = "bottom",
+        legend.direction   = "vertical",
+        legend.text        = element_text(size = 8),
+        legend.key.size    = unit(0.45, "cm"),
+        legend.margin      = margin(t = 2, b = 0),
+        plot.title         = element_text(face = "bold", size = 11, margin = margin(b = 2)),
+        plot.subtitle      = element_text(size = 8.5, color = "grey25", margin = margin(b = 6)),
+        axis.line          = element_blank(),
+        axis.ticks         = element_blank(),
+        axis.text.y        = element_blank(),
+        axis.text.x        = element_text(face = "bold", size = 9, margin = margin(t = 4)))
+pC
+# Companion transition table — backbone of the plot.
+trans_tbl <- flow_src %>%
+  dplyr::count(C4_bin, C1_bin, name = "n_TFs") %>%
+  mutate(C4_bin = factor(C4_bin, levels = star_lab),
+         C1_bin = factor(C1_bin, levels = star_lab),
+         pct    = sprintf("%.1f%%", n_TFs / nrow(flow_src) * 100)) %>%
+  arrange(C4_bin, C1_bin)
+trans_tbl
+ggsave(pC, file = file.path(plots_dir, "catTFRE_design_CiiDER_C1_C4.pdf"), height = 4, width = 5)
+```
+
+
+```{r}
+flow_src <- ud_TF
+# Step 1: aggregate transitions so each ribbon = ONE merged stream
+flow_df <- flow_src %>%
+  count(C4_bin, C1_bin, name = "n_TFs") %>%
+  mutate(C4_bin    = factor(C4_bin, levels = star_lab),
+         C1_bin    = factor(C1_bin, levels = star_lab),
+         direction = case_when(as.integer(C1_bin) > as.integer(C4_bin) ~ "C1 > C4 (gained)",
+                               as.integer(C1_bin) < as.integer(C4_bin) ~ "C1 < C4 (lost)",
+                               TRUE                                    ~ "C1 = C4 (no change)"))
+
+# Step 2: pre-compute stratum label positions (OUTSIDE the bars)
+make_strat_labels <- function(bin_col, axis_x) {
+  flow_src %>%
+    count(bin = .data[[bin_col]]) %>%
+    mutate(bin = factor(bin, levels = star_lab)) %>%
+    complete(bin, fill = list(n = 0)) %>%
+    arrange(desc(bin)) %>%                 # **** first → bottom of plot
+    mutate(cum_top = cumsum(n),
+           y       = cum_top - n / 2,
+           x       = axis_x) %>%
+    filter(n > 0)
+}
+strat_lab <- bind_rows(make_strat_labels("C4_bin", 1) %>% mutate(hjust = 1.15),
+                       make_strat_labels("C1_bin", 2) %>% mutate(hjust = -0.15))
+
+
+# Step 3: pre-compute the y-midpoint of every ribbon for per-flow labels.
+strat_y_top <- function(bin_col) {
+  flow_src %>%
+    count(bin = .data[[bin_col]]) %>%
+    mutate(bin = factor(bin, levels = star_lab)) %>%
+    complete(bin, fill = list(n = 0)) %>%
+    arrange(desc(bin)) %>%
+    mutate(strat_top = cumsum(n))
+}
+sC4 <- strat_y_top("C4_bin")
+sC1 <- strat_y_top("C1_bin")
+
+left_pos <- flow_df %>%
+  arrange(desc(C4_bin), C1_bin) %>%
+  group_by(C4_bin) %>%
+  mutate(off = cumsum(n_TFs) - n_TFs / 2) %>%
+  ungroup() %>%
+  left_join(sC4 %>% select(bin, strat_top), by = c("C4_bin" = "bin")) %>%
+  mutate(y_left = strat_top - off) %>%
+  select(C4_bin, C1_bin, y_left)
+
+right_pos <- flow_df %>%
+  arrange(desc(C1_bin), C4_bin) %>%
+  group_by(C1_bin) %>%
+  mutate(off = cumsum(n_TFs) - n_TFs / 2) %>%
+  ungroup() %>%
+  left_join(sC1 %>% select(bin, strat_top), by = c("C1_bin" = "bin")) %>%
+  mutate(y_right = strat_top - off) %>%
+  select(C4_bin, C1_bin, y_right)
+
+flow_lbl <- flow_df %>%
+  left_join(left_pos,  by = c("C4_bin", "C1_bin")) %>%
+  left_join(right_pos, by = c("C4_bin", "C1_bin")) %>%
+  mutate(y_mid = (y_left + y_right) / 2, x_mid = 1.5)
+
+pC2 <- ggplot(flow_df,
+             aes(axis1 = C4_bin, axis2 = C1_bin, y = n_TFs)) +
+  geom_alluvium(aes(fill = direction), alpha = 0.78,
+                width = 0.18, knot.pos = 0.40,
+                color = "white", linewidth = 0.3) +
+  geom_stratum(width = 0.18, fill = "grey92", color = "grey40",
+               linewidth = 0.4) +
+  # External labels (bin + count) — placed via x/y, NOT stat="stratum"
+  geom_text(data        = strat_lab,
+            aes(x = x, y = y,
+                label = sprintf("%s (n=%d)", bin, n),
+                hjust = hjust),
+            size = 2.7, inherit.aes = FALSE) +
+  # Per-ribbon count labels — what you asked for
+  geom_label(data        = flow_lbl,
+             aes(x = x_mid, y = y_mid, label = n_TFs),
+             size          = 2.3,
+             fontface      = "bold",
+             color         = "grey10",
+             fill          = scales::alpha("white", 0.85),
+             label.padding = unit(0.08, "lines"),
+             label.r       = unit(0.05, "lines"),
+             label.size    = 0,
+             inherit.aes   = FALSE) +
+  scale_x_continuous(breaks = c(1, 2),
+                     labels = c("C4\n(control)", "C1\n(designed)"),
+                     limits = c(0.45, 2.55),
+                     expand = c(0, 0)) +
+  scale_fill_manual(values = c("C1 > C4 (gained)"    = "#d62728",
+                               "C1 < C4 (lost)"      = "#1f77b4",
+                               "C1 = C4 (no change)" = "#bdbdbd"),
+                    name = NULL,
+                    breaks = c("C1 > C4 (gained)",
+                               "C1 = C4 (no change)",
+                               "C1 < C4 (lost)")) +
+  labs(title    = "C. Shift in CiiDER bin (C4 → C1)",
+       subtitle = sprintf("%d / %d designed TFs gained signal  Wilcoxon p = %.1e",
+                          sum(flow_src$`Enriched_C1>C4`),
+                          nrow(flow_src), wsr$p.value),
+       x = NULL, y = NULL) +
+  theme_classic(base_size = 10) +
+  theme(legend.position    = "bottom",
+        legend.direction   = "vertical",
+        legend.text        = element_text(size = 8),
+        legend.key.size    = unit(0.45, "cm"),
+        legend.margin      = margin(t = 2, b = 0),
+        plot.title         = element_text(face = "bold", size = 11, margin = margin(b = 2)),
+        plot.subtitle      = element_text(size = 8.5, color = "grey25", margin = margin(b = 6)),
+        axis.line          = element_blank(),
+        axis.ticks         = element_blank(),
+        axis.text.y        = element_blank(),
+        axis.text.x        = element_text(face = "bold", size = 9, margin = margin(t = 4)))
+pC2
+
+# Save the plot
+ggsave(file.path(plots_dir, "catTFRE_design_CiiDER_C1_C4_new.pdf"), pC2, width = 3.6, height = 5.5)
+```
+
+
+## D. Heatmap of every designed TF
+```{r panelD, fig.width=14, fig.height=4}
+hm <- ud %>%
+  arrange(desc(C1_ord), desc(delta)) %>%
+  mutate(TF = factor(TF, levels = TF)) %>%
+  dplyr::select(TF, C1_ord, C4_ord) %>%
+  pivot_longer(c(C1_ord, C4_ord), names_to = "clone", values_to = "ord") %>%
+  mutate(clone   = factor(ifelse(clone == "C1_ord","C1","C4"), levels = c("C1","C4")),
+         bin_lab = star_lab[ord + 1L])
+
+pD <- ggplot(hm, aes(TF, clone, fill = ord)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = bin_lab,
+                color = ifelse(ord >= 2, "white", "black")), size = 1.9) +
+  scale_color_identity() +
+  scale_fill_gradientn(colors = c("#f7fbff","#bcd2e8","#7ba9d6","#3a7cbe","#0d3b66"),
+                       breaks = 0:4, #labels = star_lab, 
+                       name = "Bin") +
+  labs(title = "D. CiiDER bin per designed TF (sorted by C1 strength, then Δ)",
+       x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 5))
+pD
+ggsave(pD, file=file.path(plots_dir, "catTFRE_design_CiiDER_C1_C4_heatmap.pdf"), height = 2, width = 15) 
+
+```
+
+## E. Confusion matrix (Designed × CiiDER C1 significance)
+
+```{r panelE}
+mat_to_long <- function(mat, clone_label) {
+  as.data.frame.table(mat, responseName = "n") %>%
+    setNames(c("Designed", "Sig", "n")) %>%
+    mutate(Designed = factor(Designed,
+                             levels = c("Designed (unique)", "Not designed")),
+           Sig      = factor(Sig,
+                             levels = c("Detected (≥*)", "Not detected (NA)")),
+           Clone    = clone_label)
+}
+
+plot_df <- bind_rows(mat_to_long(tab_C4, "C4"),
+                     mat_to_long(tab_C1, "C1"))
+
+# Two annotation labels per facet so the units are unambiguous.
+ann_df <- bind_rows(
+  tibble(Clone = "C1",
+         label = sprintf("Recall = %d / %d = %.0f%%\nFisher OR = %.1f, p = %.1g",
+                         n_des_C1_sig,
+                         n_des_C1_sig + n_des_C1_notsig,
+                         recall_C1 * 100,
+                         fish_C1$estimate, fish_C1$p.value)),
+  tibble(Clone = "C4",
+         label = sprintf("Recall = %d / %d = %.0f%%\nFisher OR = %.1f, p = %.1g",
+                         n_des_C4_sig,
+                         n_des_C4_sig + n_des_C4_notsig,
+                         recall_C4 * 100,
+                         fish_C4$estimate, fish_C4$p.value)))
+
+pE <- ggplot(plot_df, aes(Sig, Designed, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = format(n, big.mark = ","),
+                color = ifelse(n > max(n) / 2, "white", "black")),
+            size = 4.5, fontface = "bold") +
+  geom_text(data = ann_df, aes(x = 1.5, y = 0.42, label = label),
+            inherit.aes = FALSE, size = 2.5, color = "grey25",
+            lineheight = 0.9) +
+  scale_color_identity() +
+  scale_fill_gradient(low = "#fff5eb", high = "darkgreen", guide = "none") +
+  facet_wrap(~ Clone) +
+  labs(title    = "Designed TFs vs CiiDER significance (TF-level counts)",
+       subtitle = sprintf("Designed denominator = %d unique TFs; non-designed denominator = %d CiiDER motifs",
+                          nrow(ud_TF), nrow(ud),
+                          n_nd_C1_sig + n_nd_C1_notsig),
+       x = NULL, y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(strip.text    = element_text(face = "bold"),
+        panel.grid    = element_blank(),
+        plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 8.5, color = "grey25"))
+pE
+# save the plot
+ggsave(file.path(plots_dir, "catTFRE_design_CiiDER_combined.pdf"), pE, height = 3.6, width = 7.2)
+```
+
+
+# Export comparison workbook
+
+```{r export}
+wb <- createWorkbook()
+hdr <- createStyle(fontColour = "white", fgFill = "#1F4E78",
+                   textDecoration = "bold", halign = "center")
+ok  <- createStyle(fgFill = "#C6EFCE")
+bad <- createStyle(fgFill = "#FFC7CE")
+
+addWorksheet(wb, "Summary"); writeData(wb, "Summary", stats_tbl, headerStyle = hdr)
+setColWidths(wb, "Summary", 1:2, c(48, 22))
+
+addWorksheet(wb, "Designed_TFs")
+ud_out <- ud %>%
+  dplyr::select(Designed_TF = TF, Start, End, Sequence = `Seq.`,
+         CiiDER_match = best_match, CiiDER = CiiDER,
+         C1_bin, C4_bin, `Delta(C1-C4_ord)` = delta,
+         Detected_C4, Detected_C1, Strong_C4, Strong_C1, `Enriched_C1>C4`)
+writeData(wb, "Designed_TFs", ud_out, headerStyle = hdr)
+freezePane(wb, "Designed_TFs", firstRow = TRUE)
+setColWidths(wb, "Designed_TFs", 1:ncol(ud_out), 16)
+
+addWorksheet(wb, "All_CiiDER")
+ci_out <- CiiDER_results %>%
+  dplyr::select(TF, Clone_C1, Clone_C4, C1_ord, C4_ord, delta, Designed) %>%
+  arrange(desc(Designed), desc(C1_ord), desc(delta))
+writeData(wb, "All_CiiDER", ci_out, headerStyle = hdr)
+freezePane(wb, "All_CiiDER", firstRow = TRUE)
+setColWidths(wb, "All_CiiDER", 1:ncol(ci_out), 14)
+
+addWorksheet(wb, "Not_Detected")
+miss <- ud %>%
+  dplyr::filter(!Detected_C1 & Detected_C4) %>%
+  dplyr::select(Designed_TF = TF, Start, End, Sequence = `Seq.`,
+         CiiDER_table = CiiDER, Best_match = best_match)
+writeData(wb, "Not_Detected", miss, headerStyle = hdr)
+setColWidths(wb, "Not_Detected", 1:ncol(miss), 18)
+# Write the excel sheet
+saveWorkbook(wb, file.path(plots_dir, "Design_vs_CiiDER_comparison.xlsx"), overwrite = TRUE)
+```
+
+# Session info
+```{r session}
+sessionInfo()
+```
