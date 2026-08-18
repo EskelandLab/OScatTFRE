@@ -14,5 +14,5 @@ We also analysed two pulldowns together: "3.OS_catTRFE_C1C4_Final"
 We utilized [PANDA](https://netzoo.github.io/zooanimals/panda/) to analyse generegulatory networks of catTFRE TFs: "4.OS_pandaR_C1_Final."
 ## Figure 4 and S4
 We utilized [DESeq2](https://bioconductor.org/packages//release/bioc/html/DESeq2.html) for analysis of RNAseq in osteosarcoma cell lines "5.RNAseq_OS_FINAL_RAW_DESeq2"
-Integrative analysis of transcription factor gene regulation, chromatin accessibility and enhancer/promoter regulation was performed with [ANANSE](https://github.com/vanheeringen-lab/ANANSE) : "6.ANANSE_DMSO_analysis"
+Integrative analysis of transcription factor gene regulation, chromatin accessibility and enhancer/promoter regulation was performed with [ANANSE](https://github.com/vanheeringen-lab/ANANSE): "6.ANANSE_DMSO_analysis"
 "6.OS_ChIPseq_RNAseq_ATACseq_ANANSE_multiomics_bashscript"
