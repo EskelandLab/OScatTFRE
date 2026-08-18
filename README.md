@@ -8,11 +8,11 @@ All analysis has been performed in [R](r-project.org).
 Comparisons of TF motif design and [CiiiDER](https://ciiider.erc.monash.edu/) predictions. Figure 1B-D and supplemental figure 1B-E "1.catTFFRE_design_CiiDER_Final"
 
 ## Figure 2 and S2
-"2.catTFRE_rHOS_MG63_U2OS_Final"
-"3.OS_catTRFE_C1C4_Final"
+Proteomics analysis of catTFRE in osteosarcoma cell lines: "2.catTFRE_rHOS_MG63_U2OS_Final" .
+We also analysed two pulldowns together: "3.OS_catTRFE_C1C4_Final"
 ## Figure 3 and S3
-"4.OS_pandaR_C1_Final."
+We utilized [PANDA](https://netzoo.github.io/zooanimals/panda/) to analyse generegulatory networks of catTFRE TFs: "4.OS_pandaR_C1_Final."
 ## Figure 4 and S4
-"5.RNAseq_OS_FINAL_RAW_DESeq2"
-"6.ANANSE_DMSO_analysis."
+We utilized [DESeq2](https://bioconductor.org/packages//release/bioc/html/DESeq2.html) for analysis of RNAseq in osteosarcoma cell lines "5.RNAseq_OS_FINAL_RAW_DESeq2"
+Integrative analysis of transcription factor gene regulation, chromatin accessibility and enhancer/promoter regulation was performed with [ANANSE](https://github.com/vanheeringen-lab/ANANSE) : "6.ANANSE_DMSO_analysis"
 "6.OS_ChIPseq_RNAseq_ATACseq_ANANSE_multiomics_bashscript"
